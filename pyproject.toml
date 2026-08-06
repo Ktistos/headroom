@@ -96,13 +96,12 @@ proxy-prod = [
     "gunicorn>=21.0.0; sys_platform != 'win32'",
 ]
 # AST-based code compression (tree-sitter)
-# tree-sitter-language-pack >=1.0 removed the bundled tree-sitter package and
-# switched to an incompatible internal node API (.kind vs .type, callable
-# root_node, etc.).  Pin to <1.0.0 so that tree-sitter>=0.25.2 is pulled in
-# as a transitive dependency and the existing code_compressor.py node-walk
-# logic continues to work.  See issue #1216.
+# Early tree-sitter-language-pack 1.x releases exposed an incompatible internal
+# node API.  Version 1.14.3 restores the standard tree_sitter.Parser/Node API
+# used by code_compressor.py and is verified with tree-sitter 0.25.2.  Keep the
+# next-major cap so another API break requires explicit validation.
 code = [
-    "tree-sitter-language-pack>=0.10.0,<1.0",
+    "tree-sitter-language-pack>=1.14.3,<2.0",
     "tree-sitter>=0.25.2,<0.27",
 ]
 # ML-based compression with Kompress (ModernBERT).
