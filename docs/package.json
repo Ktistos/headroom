@@ -3,10 +3,11 @@
 	"version": "0.0.0",
 	"private": true,
 	"scripts": {
+		"prebuild": "next typegen && node node_modules/@typescript/native/bin/tsc --noEmit",
 		"build": "next build",
 		"dev": "next dev",
 		"start": "next start",
-		"types:check": "fumadocs-mdx && next typegen && tsc --noEmit",
+		"types:check": "fumadocs-mdx && next typegen && node node_modules/@typescript/native/bin/tsc --noEmit",
 		"postinstall": "fumadocs-mdx"
 	},
 	"dependencies": {
@@ -26,7 +27,8 @@
 		"recharts": "^3.9.2",
 		"tailwind-merge": "^3.5.0"
 	},
-	"devDependencies": {
+  "devDependencies": {
+    "@typescript/native": "npm:typescript@^7.0.2",
 		"@ai-sdk/openai": "^3.0.51",
 		"@anthropic-ai/sdk": "^0.111.0",
 		"@tailwindcss/postcss": "^4.3.2",
@@ -38,7 +40,7 @@
 		"openai": "^6.47.0",
 		"postcss": "^8.5.26",
 		"tailwindcss": "^4.2.2",
-		"typescript": "^7.0.2"
+    "typescript": "^6.0.3"
 	},
 	"overrides": {
 		"postcss": "$postcss"
