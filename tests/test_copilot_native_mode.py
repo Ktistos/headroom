@@ -47,6 +47,19 @@ def test_native_support_probe_distinguishes_unknown_and_unsupported(tmp_path) ->
     assert native_api_url_supported(environ={"LOCALAPPDATA": str(local)}) is True
 
 
+def test_native_support_probe_skips_unreadable_bundle(monkeypatch, tmp_path) -> None:
+    local = tmp_path / "local"
+    bundle = local / "copilot" / "pkg" / "platform" / "1.0" / "app.js"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("process.env.COPILOT_API_URL", encoding="utf-8")
+
+    def _unreadable(*_args, **_kwargs):
+        raise OSError("synthetic unreadable bundle")
+
+    monkeypatch.setattr("builtins.open", _unreadable)
+    assert native_api_url_supported(environ={"LOCALAPPDATA": str(local)}) is False
+
+
 def _invoke_native(
     monkeypatch: pytest.MonkeyPatch,
     extra: list[str] | None = None,
@@ -126,3 +139,10 @@ def test_native_cli_refuses_known_unsupported_bundle(monkeypatch) -> None:
     assert result.exit_code != 0
     assert "COPILOT_API_URL" in result.output
     assert not captured
+
+
+def test_native_cli_reports_unknown_support_in_verbose_mode(monkeypatch) -> None:
+    result, captured = _invoke_native(monkeypatch, ["--verbose"], support=None)
+    assert result.exit_code == 0, result.output
+    assert "could not verify" in result.output
+    assert captured
