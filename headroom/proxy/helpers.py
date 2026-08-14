@@ -2858,8 +2858,9 @@ def inject_tool_search_deferral(
     if not isinstance(tools, list) or len(tools) < _TOOL_SEARCH_MIN_TOOLS:
         return tools
     for tool in tools:
-        if isinstance(tool, dict) and str(tool.get("type", "")).startswith(
-            _TOOL_SEARCH_TOOL_TYPE_PREFIX
+        if isinstance(tool, dict) and (
+            str(tool.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+            or str(tool.get("name") or "").lower().startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         ):
             return tools  # client already uses tool search — leave it alone
 
@@ -2974,7 +2975,19 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
         return messages, 0
 
     tool_list = tools if isinstance(tools, list) else []
-    available = {str(t["name"]) for t in tool_list if isinstance(t, dict) and t.get("name")}
+    # Typed search tools (type starts with "tool_search_tool_") are the search
+    # mechanism itself — they are never the target of a tool_reference lookup.
+    # Excluding them from `available` ensures that a stale history entry that
+    # references "tool_search_tool_regex" (from a turn where inject deferred a
+    # typeless client tool with that name) is correctly dropped rather than
+    # falsely kept because the injected typed search tool shares the same name.
+    available = {
+        str(t["name"])
+        for t in tool_list
+        if isinstance(t, dict)
+        and t.get("name")
+        and not str(t.get("type") or "").startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
+    }
     has_search_tool = any(
         isinstance(t, dict) and str(t.get("type", "")).startswith(_TOOL_SEARCH_TOOL_TYPE_PREFIX)
         for t in tool_list
