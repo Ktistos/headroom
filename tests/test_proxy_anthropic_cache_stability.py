@@ -2030,3 +2030,98 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
         f"{captured_b['frozen_message_count']}. The optimization path must "
         f"be identical for both."
     )
+
+
+def test_anthropic_batch_rows_have_independent_transactions_and_request_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.transforms.content_router import current_policy_side_effect_transaction
+
+    monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "control")
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    state: dict[str, list[int]] = {"committed": [], "discarded": []}
+    pipeline_calls: list[dict[str, object]] = []
+    captured: dict[str, object] = {}
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.config.mode = "token"
+
+        def apply(**kwargs):
+            row_index = len(pipeline_calls)
+            pipeline_calls.append(kwargs)
+            transaction = current_policy_side_effect_transaction()
+            assert transaction is not None
+            transaction.register(
+                f"anthropic-batch-row-{row_index}",
+                commit=lambda row_index=row_index: state["committed"].append(row_index),
+                discard=lambda row_index=row_index: state["discarded"].append(row_index),
+            )
+            return SimpleNamespace(
+                messages=[{"role": "user", "content": f"compressed-{row_index}"}],
+                timing={},
+                tokens_before=100,
+                tokens_after=50 if row_index == 0 else 120,
+            )
+
+        proxy.anthropic_pipeline.apply = apply
+
+        async def retry(method, url, headers, body, **kwargs):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msgbatch_tx",
+                    "type": "message_batch",
+                    "processing_status": "in_progress",
+                    "request_counts": {
+                        "processing": 2,
+                        "succeeded": 0,
+                        "errored": 0,
+                        "canceled": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = retry
+        response = client.post(
+            "/v1/messages/batches",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "requests": [
+                    {
+                        "custom_id": f"row-{index}",
+                        "params": {
+                            "model": "claude-sonnet-4-6",
+                            "max_tokens": 128,
+                            "messages": [{"role": "user", "content": f"original-{index}"}],
+                        },
+                    }
+                    for index in range(2)
+                ]
+            },
+        )
+
+    assert response.status_code == 200
+    assert state == {"committed": [0], "discarded": [1]}
+    request_ids = [str(call["request_id"]) for call in pipeline_calls]
+    assert request_ids[0].endswith(":item:0:row-0")
+    assert request_ids[1].endswith(":item:1:row-1")
+    assert len(set(request_ids)) == 2
+    assert all(
+        call["session_id"] == request_ids[0].split(":item:", 1)[0] for call in pipeline_calls
+    )
+    rows = captured["body"]["requests"]
+    assert rows[0]["params"]["messages"][0]["content"] == "compressed-0"
+    assert rows[1]["params"]["messages"][0]["content"] == "original-1"

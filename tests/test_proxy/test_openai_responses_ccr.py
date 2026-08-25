@@ -195,6 +195,44 @@ def test_ccr_intercept_exception_is_reraised_not_swallowed():
     assert "function_call" not in json.dumps(body)
 
 
+def test_ccr_continuation_rejects_non_success_status():
+    app = _make_app()
+    with TestClient(app) as client:
+        server = app.state.proxy
+        calls: list[dict] = []
+
+        async def fake_retry(method, url, headers, body, stream=False, **kwargs):
+            calls.append(body)
+            if len(calls) == 1:
+                return _tool_call_response(url)
+            return httpx.Response(503, json={"error": "busy"}, request=httpx.Request("POST", url))
+
+        class _CCRHandler:
+            def has_ccr_tool_calls(self, response, provider):  # noqa: ANN001
+                return True
+
+            async def handle_response(  # noqa: ANN001
+                self, response, messages, tools, api_call_fn, provider
+            ):
+                return await api_call_fn(messages, tools)
+
+        server._retry_request = fake_retry
+        server.ccr_response_handler = _CCRHandler()
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "please look this up",
+                "tools": [_RETRIEVE_TOOL],
+                "stream": False,
+            },
+            headers={"Authorization": "Bearer sk-test"},
+        )
+
+    assert response.status_code == 502
+    assert len(calls) == 2
+
+
 def test_streaming_request_with_retrieve_tool_buffers_upstream_and_streams_final_result():
     """stream:true + headroom_retrieve in tools -> forced buffered stream:false upstream."""
     app = _make_app()

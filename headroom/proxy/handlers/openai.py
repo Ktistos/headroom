@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import hashlib
 import json
@@ -16,7 +17,7 @@ import re
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
@@ -541,6 +542,7 @@ def _openai_responses_unit_cache_key(
     *,
     model: str,
     target_ratio: float | None = None,
+    attribution_scope: object | None = None,
 ) -> str:
     text_hash = hashlib.sha256(unit.text.encode("utf-8", errors="replace")).hexdigest()
     key_payload = {
@@ -556,10 +558,23 @@ def _openai_responses_unit_cache_key(
         "context": unit.context,
         "question": unit.question,
         "bias": unit.bias,
-        "metadata": unit.metadata,
+        "metadata": {
+            "tool_name": unit.metadata.get("tool_name", ""),
+            "tool_context": unit.metadata.get("tool_context", ""),
+        },
         "target_ratio": target_ratio,
         "text_sha256": text_hash,
     }
+    if attribution_scope is not None:
+        # Retrieval-aware compression needs a fresh event for each provider
+        # slot. Reusing a CCR-bearing result across requests or tool calls
+        # would leave the emitted marker attributed only to the first event.
+        key_payload["attribution"] = {
+            "session_id": unit.metadata.get("session_id", ""),
+            "request_id": unit.metadata.get("request_id", ""),
+            "tool_call_id": unit.metadata.get("tool_call_id", ""),
+            "slot": attribution_scope,
+        }
     serialized = json.dumps(key_payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -1764,6 +1779,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        session_id: str | None = None,
         pass_id: str | None = None,
         timing: dict[str, float] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
@@ -1881,6 +1897,7 @@ class OpenAIHandlerMixin:
         # name on the `function_call` item and the originating call_id on the
         # matching `function_call_output`, so we correlate them here.
         function_name_by_call_id: dict[str, str] = {}
+        function_context_by_call_id: dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1894,11 +1911,88 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
+                raw_context = item.get("arguments") or item.get("input") or ""
+                function_context_by_call_id[call_id] = (
+                    raw_context
+                    if isinstance(raw_context, str)
+                    else json.dumps(raw_context, ensure_ascii=False, default=str)
+                )
             if isinstance(name, str) and (
                 name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
             ):
                 if isinstance(call_id, str) and call_id:
                     headroom_retrieve_call_ids.add(call_id)
+
+        # Stateful Responses continuations may contain only the output item.
+        # Scope correlations by conversation lineage. A unique call-ID fallback
+        # preserves compatibility when the producing request had no lineage,
+        # but collisions fail closed instead of borrowing another session's
+        # tool name, context, exclusion policy, or retrieval prior.
+        conversation = payload.get("conversation")
+        response_scope = str(
+            session_id
+            or payload.get("previous_response_id")
+            or (
+                conversation.get("id", "") if isinstance(conversation, dict) else conversation or ""
+            )
+        )
+        store_scope = response_scope or f"request:{request_id}"
+        with _OPENAI_RESPONSES_UNIT_CACHE_INIT_LOCK:
+            correlation_cache = getattr(self, "_responses_function_correlation_cache", None)
+            if not isinstance(correlation_cache, OrderedDict):
+                correlation_cache = OrderedDict()
+                self._responses_function_correlation_cache = correlation_cache
+            correlation_lock = getattr(self, "_responses_function_correlation_lock", None)
+            if correlation_lock is None:
+                correlation_lock = threading.RLock()
+                self._responses_function_correlation_lock = correlation_lock
+
+        with correlation_lock:
+            for call_id, name in function_name_by_call_id.items():
+                cache_key = (store_scope, call_id)
+                correlation_cache[cache_key] = (
+                    name,
+                    function_context_by_call_id.get(call_id, ""),
+                )
+                correlation_cache.move_to_end(cache_key)
+            while len(correlation_cache) > 4096:
+                correlation_cache.popitem(last=False)
+
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("type") not in self.OPENAI_RESPONSES_OUTPUT_TYPES
+                ):
+                    continue
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    continue
+                direct_name = item.get("name")
+                if isinstance(direct_name, str) and direct_name:
+                    function_name_by_call_id.setdefault(call_id, direct_name)
+
+                cached = (
+                    correlation_cache.get((response_scope, call_id)) if response_scope else None
+                )
+                if cached is None:
+                    candidates = [
+                        value
+                        for (candidate_scope, candidate_call_id), value in correlation_cache.items()
+                        if candidate_call_id == call_id
+                    ]
+                    if len(candidates) == 1:
+                        cached = candidates[0]
+                        if response_scope:
+                            correlation_cache[(response_scope, call_id)] = cached
+                            correlation_cache.move_to_end((response_scope, call_id))
+                if cached is not None:
+                    cached_name, cached_context = cached
+                    function_name_by_call_id.setdefault(call_id, cached_name)
+                    function_context_by_call_id.setdefault(call_id, cached_context)
+
+        for call_id, name in function_name_by_call_id.items():
+            if name == "headroom_retrieve" or name.endswith("__headroom_retrieve"):
+                headroom_retrieve_call_ids.add(call_id)
 
         # Resolve the effective exclude set once (None -> built-in defaults),
         # mirroring ContentRouter's policy. exclude_tools already contains both
@@ -2128,6 +2222,20 @@ class OpenAIHandlerMixin:
                 cache_zone="live",
                 mutable=True,
                 min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                context=function_context_by_call_id.get(str(item.get("call_id")), ""),
+                metadata={
+                    "tool_name": function_name_by_call_id.get(str(item.get("call_id")), ""),
+                    "tool_context": function_context_by_call_id.get(str(item.get("call_id")), ""),
+                    "tool_call_id": str(item.get("call_id") or ""),
+                    "provider_slot": f"input[{item_idx}].{slot_ref!r}",
+                    "recovery_payload_path": "openai_responses",
+                    "request_id": request_id,
+                    # Every public path supplies its stable conversation scope.
+                    # Direct/unit callers still receive a non-empty fallback so
+                    # identical slots from separate requests never share an
+                    # attribution/cache namespace.
+                    "session_id": response_scope or request_id,
+                },
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
@@ -2195,6 +2303,7 @@ class OpenAIHandlerMixin:
         small_batches, small_batch_skipped = build_compression_batches(
             small_batch_entries,
             min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+            preserve_tool_call_attribution=bool(router.config.retrieval_aware_enabled),
         )
         cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
         cache_miss_followers: dict[str, list[int]] = {}
@@ -2204,6 +2313,7 @@ class OpenAIHandlerMixin:
                 routed.unit,
                 model=model,
                 target_ratio=unit_target_ratio,
+                attribution_scope=(routed.slot if router.config.retrieval_aware_enabled else None),
             )
             cached = self._get_openai_responses_cached_unit(cache_key)
             if cached is not None:
@@ -2221,7 +2331,19 @@ class OpenAIHandlerMixin:
             routed: RoutedCompressionUnit,
         ) -> tuple[int, str, tuple[object, Any, float]]:
             slot, result, elapsed_ms = _compress_routed_unit(routed)
-            self._store_openai_responses_cached_unit(cache_key, result)
+            if router.config.retrieval_aware_enabled:
+                from headroom.transforms.content_router import (
+                    defer_policy_side_effect_until_commit,
+                )
+
+                defer_policy_side_effect_until_commit(
+                    lambda cache_key=cache_key, result=result: (
+                        self._store_openai_responses_cached_unit(cache_key, result)
+                    ),
+                    label="openai-responses-unit-cache",
+                )
+            else:
+                self._store_openai_responses_cached_unit(cache_key, result)
             return unit_idx, cache_key, (slot, result, elapsed_ms)
 
         def _record_routed_result(
@@ -2243,7 +2365,14 @@ class OpenAIHandlerMixin:
             executor = _openai_responses_unit_executor()
             for start in range(0, len(cache_misses), parallelism):
                 batch = cache_misses[start : start + parallelism]
-                futures = [executor.submit(_compress_and_store, *item) for item in batch]
+                futures = [
+                    executor.submit(
+                        contextvars.copy_context().run,
+                        _compress_and_store,
+                        *item,
+                    )
+                    for item in batch
+                ]
                 for future in as_completed(futures):
                     unit_idx, cache_key, routed_result = future.result()
                     _record_routed_result(unit_idx, cache_key, routed_result)
@@ -2281,7 +2410,14 @@ class OpenAIHandlerMixin:
             executor = _openai_responses_unit_executor()
             for start in range(0, len(small_batches), parallelism):
                 batch_group = small_batches[start : start + parallelism]
-                futures = [executor.submit(_compress_batch, batch) for batch in batch_group]
+                futures = [
+                    executor.submit(
+                        contextvars.copy_context().run,
+                        _compress_batch,
+                        batch,
+                    )
+                    for batch in batch_group
+                ]
                 for future in as_completed(futures):
                     _record_batch_result(future.result())
         else:
@@ -2466,6 +2602,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        session_id: str | None = None,
         timing: dict[str, float] | None = None,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
@@ -2727,6 +2864,7 @@ class OpenAIHandlerMixin:
             working,
             model=model,
             request_id=request_id,
+            session_id=session_id,
             pass_id=pass_id,
             timing=timing_sink,
         )
@@ -2849,6 +2987,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        session_id: str | None = None,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
         client: str | None = None,
         savings_tags: dict[str, Any] | None = None,
@@ -2881,6 +3020,8 @@ class OpenAIHandlerMixin:
                 "timing": timing,
                 "client": client,
             }
+            if session_id is not None:
+                compression_kwargs["session_id"] = session_id
             if savings_tags is not None:
                 compression_kwargs["savings_tags"] = savings_tags
             while True:
@@ -2894,7 +3035,7 @@ class OpenAIHandlerMixin:
                     unsupported_kwarg = next(
                         (
                             name
-                            for name in ("savings_tags", "client", "timing")
+                            for name in ("savings_tags", "client", "session_id", "timing")
                             if f"unexpected keyword argument '{name}'" in str(exc)
                             and name in compression_kwargs
                         ),
@@ -3440,6 +3581,8 @@ class OpenAIHandlerMixin:
                                 else openai_frozen_count
                             ),
                             biases=_hook_biases,
+                            request_id=request_id,
+                            session_id=openai_session_id,
                             compression_policy=compression_policy,
                             # Thread the savings-profile knobs (e.g.
                             # HEADROOM_SAVINGS_PROFILE=agent-90) onto the live
@@ -3448,6 +3591,7 @@ class OpenAIHandlerMixin:
                             # endpoint. Without this the profile's
                             # compress_user_messages/target_ratio/etc. were
                             # silently dropped here (#1534).
+                            recovery_payload_path="openai_chat",
                             **proxy_pipeline_kwargs(self.config),
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -3480,10 +3624,13 @@ class OpenAIHandlerMixin:
                             context=extract_user_query(messages),
                             frozen_message_count=apply_frozen_count,
                             biases=_hook_biases,
+                            request_id=request_id,
+                            session_id=openai_session_id,
                             compression_policy=compression_policy,
                             # Same savings-profile threading as the token-mode
                             # branch above — the non-token chat path must honor
                             # the configured profile too (#1534).
+                            recovery_payload_path="openai_chat",
                             **proxy_pipeline_kwargs(self.config),
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -3531,6 +3678,9 @@ class OpenAIHandlerMixin:
                 f"[{request_id}] Optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
             )
+            from headroom.transforms.content_router import finalize_request_policy_side_effects
+
+            finalize_request_policy_side_effects(commit=False, renew=True)
             optimized_messages = original_messages
             optimized_tokens = original_tokens
             transforms_applied = []
@@ -4245,6 +4395,11 @@ class OpenAIHandlerMixin:
                             cont_resp = await request_backend.send_openai_message(
                                 continuation_body, continuation_headers
                             )
+                            if cont_resp.error or not 200 <= cont_resp.status_code < 300:
+                                raise RuntimeError(
+                                    f"{request_backend.name} CCR continuation was rejected "
+                                    f"with HTTP {cont_resp.status_code}"
+                                )
                             return cont_resp.body
 
                         try:
@@ -5106,6 +5261,21 @@ class OpenAIHandlerMixin:
         _responses_session_id = self.session_tracker_store.compute_session_id(
             request, model, messages
         )
+        # Compression attribution cannot use the tracker fallback above: that
+        # fallback hashes only model + leading system prompt and is intentionally
+        # shared by otherwise unrelated conversations. Prefer provider lineage,
+        # then an explicit caller session, and finally this request's unique ID.
+        _responses_conversation = body.get("conversation")
+        _responses_attribution_session_id = str(
+            body.get("previous_response_id")
+            or (
+                _responses_conversation.get("id", "")
+                if isinstance(_responses_conversation, dict)
+                else _responses_conversation or ""
+            )
+            or request.headers.get("x-headroom-session-id")
+            or request_id
+        )
         from headroom.proxy.helpers import (
             get_session_beta_tracker as _get_session_beta_tracker_resp,
         )
@@ -5412,6 +5582,7 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    session_id=_responses_attribution_session_id,
                     client=client,
                     savings_tags=tags,
                 )
@@ -5896,6 +6067,11 @@ class OpenAIHandlerMixin:
                                 forwarder_name="openai_responses_ccr_continuation",
                                 path_for_log=url,
                             )
+                            if not 200 <= cont_response.status_code < 300:
+                                raise RuntimeError(
+                                    "OpenAI Responses CCR continuation was rejected "
+                                    f"with HTTP {cont_response.status_code}"
+                                )
                             return cont_response.json()
 
                         try:
@@ -6245,6 +6421,10 @@ class OpenAIHandlerMixin:
            ContentRouter path, then sends the request upstream
         5. Relays all subsequent messages bidirectionally
         """
+        from headroom.transforms.content_router import detach_request_policy_side_effects
+
+        pending_policy_transactions: deque[Any] = deque()
+
         try:
             import websockets
         except ImportError:
@@ -7223,7 +7403,8 @@ class OpenAIHandlerMixin:
                             ) = await self._compress_openai_responses_payload_in_executor(
                                 _inner,
                                 model=_model,
-                                request_id=request_id,
+                                request_id=f"{request_id}:frame:1",
+                                session_id=session_id,
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
@@ -7455,7 +7636,22 @@ class OpenAIHandlerMixin:
 
             if ws_connected:
                 async with upstream:
-                    await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
+                    first_policy_transaction = None
+                    if (
+                        isinstance(final_first_body, dict)
+                        and final_first_body.get("type") == "response.create"
+                    ):
+                        first_policy_transaction = detach_request_policy_side_effects(renew=True)
+                        if first_policy_transaction is not None:
+                            pending_policy_transactions.append(first_policy_transaction)
+                    try:
+                        await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
+                    except BaseException:
+                        if first_policy_transaction is not None:
+                            with contextlib.suppress(ValueError):
+                                pending_policy_transactions.remove(first_policy_transaction)
+                            first_policy_transaction.discard()
+                        raise
 
                     # Unit 3: flag the upstream side flips on seeing
                     # ``response.completed`` so the outer cause
@@ -7596,7 +7792,8 @@ class OpenAIHandlerMixin:
                                 ) = await self._compress_openai_responses_payload_in_executor(
                                     inner_payload,
                                     model=model_for_frame,
-                                    request_id=request_id,
+                                    request_id=f"{request_id}:frame:{frame_index}",
+                                    session_id=session_id,
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
@@ -7917,7 +8114,23 @@ class OpenAIHandlerMixin:
                                         "transforms_applied": transforms_applied,
                                     },
                                 )
-                                await upstream.send(_strip_codex_lite_metadata(msg))
+                                frame_policy_transaction = None
+                                if ws_last_client_frame_type == "response.create":
+                                    frame_policy_transaction = detach_request_policy_side_effects(
+                                        renew=True
+                                    )
+                                    if frame_policy_transaction is not None:
+                                        pending_policy_transactions.append(frame_policy_transaction)
+                                try:
+                                    await upstream.send(_strip_codex_lite_metadata(msg))
+                                except BaseException:
+                                    if frame_policy_transaction is not None:
+                                        with contextlib.suppress(ValueError):
+                                            pending_policy_transactions.remove(
+                                                frame_policy_transaction
+                                            )
+                                        frame_policy_transaction.discard()
+                                    raise
                         except asyncio.CancelledError:
                             # Explicit cancel from the outer
                             # orchestrator — re-raise so
@@ -8210,7 +8423,17 @@ class OpenAIHandlerMixin:
                                     ws_last_upstream_frame_type,
                                 )
                                 if event_type == "response.created":
+                                    if pending_policy_transactions:
+                                        pending_policy_transactions.popleft().commit()
                                     response_started_ms = time.perf_counter() * 1000.0
+                                elif event_type == "error" and pending_policy_transactions:
+                                    # A protocol error before ``response.created``
+                                    # means the oldest staged request was not
+                                    # accepted as a model turn. Terminal response
+                                    # events (failed/incomplete/cancelled) belong
+                                    # to a response that was already created; they
+                                    # must not discard a later queued request.
+                                    pending_policy_transactions.popleft().discard()
                                 (
                                     usage_input_tokens,
                                     usage_output_tokens,
@@ -8736,6 +8959,8 @@ class OpenAIHandlerMixin:
             with contextlib.suppress(Exception):
                 await websocket.close(code=1011, reason=str(e)[:120])
         finally:
+            while pending_policy_transactions:
+                pending_policy_transactions.popleft().discard()
             # Unit 2: emit structured per-session stage timings.
             stage_timer.record(
                 "total_session",
@@ -9213,6 +9438,11 @@ class OpenAIHandlerMixin:
             )
 
         start_time = time.time()
+        compression_request_id = (
+            await self._next_request_id()
+            if hasattr(self, "_next_request_id")
+            else f"compress_{int(start_time * 1_000_000)}"
+        )
         headers = dict(request.headers)
         tags = extract_tags(headers)
         client = classify_client(headers)
@@ -9335,10 +9565,26 @@ class OpenAIHandlerMixin:
                 lambda: pipeline.apply(
                     messages=messages,
                     model=model,
+                    request_id=compression_request_id,
+                    session_id=compression_request_id,
+                    # The compression-only caller controls how a returned CCR
+                    # marker is ultimately redeemed; no provider path is known
+                    # at this boundary, so use the configured unknown fallback.
+                    recovery_payload_path="unknown",
                     **pipeline_kwargs,
                 ),
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
+            if result.tokens_after > result.tokens_before:
+                from headroom.transforms.content_router import (
+                    finalize_request_policy_side_effects,
+                )
+
+                finalize_request_policy_side_effects(commit=False, renew=True)
+                result.messages = messages
+                result.tokens_after = result.tokens_before
+                result.transforms_applied = []
+                result.markers_inserted = []
             ccr_hashes = _response_ccr_hashes(result.messages, result.markers_inserted)
 
             tokens_before = result.tokens_before
@@ -9347,11 +9593,7 @@ class OpenAIHandlerMixin:
             latency_ms = (time.time() - start_time) * 1000
             await self._record_request_outcome(
                 RequestOutcome(
-                    request_id=(
-                        await self._next_request_id()
-                        if hasattr(self, "_next_request_id")
-                        else f"compress_{int(time.time())}"
-                    ),
+                    request_id=compression_request_id,
                     provider="compress",
                     model=model if isinstance(model, str) else str(model),
                     original_tokens=tokens_before,
@@ -9399,11 +9641,7 @@ class OpenAIHandlerMixin:
             latency_ms = (time.time() - start_time) * 1000
             await self._record_request_outcome(
                 RequestOutcome(
-                    request_id=(
-                        await self._next_request_id()
-                        if hasattr(self, "_next_request_id")
-                        else f"compress_{int(time.time())}"
-                    ),
+                    request_id=compression_request_id,
                     provider="compress",
                     model=model if isinstance(model, str) else str(model),
                     original_tokens=0,

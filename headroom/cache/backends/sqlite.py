@@ -18,13 +18,14 @@ backend, or ``HEADROOM_CCR_SQLITE_PATH`` to relocate the database file
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -41,7 +42,17 @@ CREATE TABLE IF NOT EXISTS ccr_entries (
     ttl INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ccr_expiry ON ccr_entries (created_at);
+CREATE TABLE IF NOT EXISTS ccr_discarded_events (
+    compression_event_id TEXT PRIMARY KEY,
+    expires_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ccr_discarded_expiry
+    ON ccr_discarded_events (expires_at);
 """
+
+# A tombstone outlives the default CCR entry long enough to reject a stale
+# post-discard write. Entries with a longer configured TTL extend it.
+_DISCARD_TOMBSTONE_TTL_SECONDS = 1800
 
 # Purge expired rows at most this often (seconds). Purging is hygiene,
 # not correctness — CompressionStore checks TTL on every get().
@@ -73,6 +84,10 @@ class SQLiteBackend:
     field (one without a default) raises ``TypeError`` on construction.
     """
 
+    # CompressionStore must not pre-merge a stale read: ``set`` performs the
+    # merge under BEGIN IMMEDIATE and is the cross-worker source of truth.
+    merges_attribution_candidates_atomically = True
+
     def __init__(self, db_path: str | Path | None = None) -> None:
         self._path = Path(db_path).expanduser() if db_path else default_db_path()
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,9 +108,14 @@ class SQLiteBackend:
         # on writes, so a quiet store could otherwise hold expired
         # originals (which may contain sensitive tool output) on disk
         # indefinitely. Sweep them on every open.
+        now = time.time()
         conn.execute(
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
-            (time.time(),),
+            (now,),
+        )
+        conn.execute(
+            "DELETE FROM ccr_discarded_events WHERE expires_at < ?",
+            (now,),
         )
         conn.commit()
         # Originals can contain sensitive tool output (file contents,
@@ -163,6 +183,10 @@ class SQLiteBackend:
             "DELETE FROM ccr_entries WHERE created_at + ttl < ?",
             (now,),
         )
+        self._conn.execute(
+            "DELETE FROM ccr_discarded_events WHERE expires_at < ?",
+            (now,),
+        )
         self._conn.commit()
 
     def get(self, hash_key: str) -> CompressionEntry | None:
@@ -180,9 +204,109 @@ class SQLiteBackend:
         return self._entry_from_json(row[0])
 
     def set(self, hash_key: str, entry: CompressionEntry) -> None:
-        payload = json.dumps(asdict(entry), ensure_ascii=False)
         with self._lock:
             try:
+                # Serialize same-hash attribution merging across workers. A
+                # process-local CompressionStore lock cannot protect two live
+                # SQLite connections from a stale read followed by overwrite.
+                self._conn.execute("BEGIN IMMEDIATE")
+                from ..compression_store import (
+                    MAX_ATTRIBUTION_CANDIDATES,
+                    _attribution_candidates,
+                    _candidate_identity,
+                    _entry_attribution_candidate,
+                    _legacy_unattributed_candidate,
+                )
+
+                # Persisted tombstones distinguish a genuinely new delayed
+                # compression event from a stale snapshot written after that
+                # event was rejected by another process. Filter every carried
+                # candidate before considering the same-hash merge.
+                incoming_candidates = _attribution_candidates(entry)
+                now = time.time()
+                filtered_candidates: list[dict[str, str]] = []
+                for candidate in incoming_candidates:
+                    event_id = candidate.get("compression_event_id", "")
+                    tombstoned = False
+                    if event_id:
+                        tombstoned = (
+                            self._conn.execute(
+                                "SELECT 1 FROM ccr_discarded_events "
+                                "WHERE compression_event_id = ? AND expires_at >= ?",
+                                (event_id, now),
+                            ).fetchone()
+                            is not None
+                        )
+                    if not tombstoned:
+                        filtered_candidates.append(candidate)
+                if incoming_candidates and not filtered_candidates:
+                    self._conn.commit()
+                    return
+                if len(filtered_candidates) != len(incoming_candidates):
+                    preserved = filtered_candidates[-1]
+                    entry = replace(
+                        entry,
+                        attribution_candidates=[dict(item) for item in filtered_candidates],
+                        compression_event_id=preserved["compression_event_id"] or None,
+                        retrieval_handle=preserved["retrieval_handle"] or None,
+                        session_id=preserved["session_id"] or None,
+                        request_id=preserved["request_id"] or None,
+                        tool_call_id=preserved["tool_call_id"] or None,
+                        provider_slot=preserved["provider_slot"] or None,
+                        tool_name=preserved["tool_name"] or None,
+                        compression_strategy=preserved["compression_strategy"] or None,
+                        tool_signature_hash=preserved["tool_signature_hash"] or None,
+                        attribution_kind=preserved["attribution_kind"] or None,
+                    )
+
+                row = self._conn.execute(
+                    "SELECT entry_json FROM ccr_entries WHERE hash = ?",
+                    (hash_key,),
+                ).fetchone()
+                if row is not None:
+                    existing = self._entry_from_json(row[0])
+                    if existing is not None and existing.original_content == entry.original_content:
+                        # A store operation contributes only its top-level
+                        # candidate. Never union every candidate carried by the
+                        # incoming object: it may be a stale pre-discard read
+                        # from another worker.
+                        merged = _attribution_candidates(existing)
+                        if not merged:
+                            merged = [_legacy_unattributed_candidate()]
+                        incoming_candidates = _attribution_candidates(entry)
+                        current_candidate = _entry_attribution_candidate(entry)
+                        accept_current_candidate = len(incoming_candidates) <= 1
+                        if accept_current_candidate and any(current_candidate.values()):
+                            identity = _candidate_identity(current_candidate)
+                            merged = [
+                                item for item in merged if _candidate_identity(item) != identity
+                            ]
+                            merged.append(current_candidate)
+                        entry = replace(
+                            entry,
+                            attribution_candidates=merged[-MAX_ATTRIBUTION_CANDIDATES:],
+                            retrieval_count=existing.retrieval_count,
+                            search_queries=list(existing.search_queries),
+                            last_accessed=existing.last_accessed,
+                        )
+                        if (
+                            not accept_current_candidate or not any(current_candidate.values())
+                        ) and merged:
+                            preserved = merged[-1]
+                            entry = replace(
+                                entry,
+                                compression_event_id=preserved["compression_event_id"] or None,
+                                retrieval_handle=preserved["retrieval_handle"] or None,
+                                session_id=preserved["session_id"] or None,
+                                request_id=preserved["request_id"] or None,
+                                tool_call_id=preserved["tool_call_id"] or None,
+                                provider_slot=preserved["provider_slot"] or None,
+                                tool_name=preserved["tool_name"] or None,
+                                compression_strategy=preserved["compression_strategy"] or None,
+                                tool_signature_hash=preserved["tool_signature_hash"] or None,
+                                attribution_kind=preserved["attribution_kind"] or None,
+                            )
+                payload = json.dumps(asdict(entry), ensure_ascii=False)
                 self._conn.execute(
                     "INSERT OR REPLACE INTO ccr_entries "
                     "(hash, entry_json, created_at, ttl) VALUES (?, ?, ?, ?)",
@@ -191,7 +315,143 @@ class SQLiteBackend:
                 self._conn.commit()
                 self._maybe_purge()
             except sqlite3.DatabaseError as e:
+                with contextlib.suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
                 self._handle_db_error(e, "set")
+            except Exception:
+                # A malformed legacy entry can fail while it is being decoded
+                # after BEGIN IMMEDIATE. Never leave that write transaction
+                # open if the non-database exception must propagate.
+                with contextlib.suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
+                raise
+
+    def retrieve_and_record_access(
+        self,
+        hash_key: str,
+        query: str | None = None,
+        *,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        tool_call_id: str | None = None,
+        provider_slot: str | None = None,
+    ) -> tuple[str, CompressionEntry | None]:
+        """Resolve attribution and increment feedback in one transaction."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT entry_json FROM ccr_entries WHERE hash = ?",
+                    (hash_key,),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return "missing", None
+                entry = self._entry_from_json(row[0])
+                if entry is None:
+                    self._conn.commit()
+                    return "unresolved", None
+                if entry.is_expired():
+                    self._conn.execute("DELETE FROM ccr_entries WHERE hash = ?", (hash_key,))
+                    self._conn.commit()
+                    return "expired", None
+
+                from ..compression_store import (
+                    _entry_attribution_resolution_status,
+                    _entry_with_resolved_attribution,
+                )
+
+                status = _entry_attribution_resolution_status(
+                    entry,
+                    compression_event_id=compression_event_id,
+                    retrieval_handle=retrieval_handle,
+                    session_id=session_id,
+                    request_id=request_id,
+                    tool_call_id=tool_call_id,
+                    provider_slot=provider_slot,
+                )
+                if status != "available":
+                    self._conn.commit()
+                    return status, None
+
+                entry.record_access(query)
+                payload = json.dumps(asdict(entry), ensure_ascii=False)
+                self._conn.execute(
+                    "UPDATE ccr_entries SET entry_json = ? WHERE hash = ?",
+                    (payload, hash_key),
+                )
+                self._conn.commit()
+                resolved = _entry_with_resolved_attribution(
+                    entry,
+                    compression_event_id=compression_event_id,
+                    retrieval_handle=retrieval_handle,
+                    session_id=session_id,
+                    request_id=request_id,
+                    tool_call_id=tool_call_id,
+                    provider_slot=provider_slot,
+                )
+                return "available", resolved
+            except sqlite3.DatabaseError as e:
+                with contextlib.suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
+                self._handle_db_error(e, "retrieve and record access")
+                return "missing", None
+            except Exception:
+                with contextlib.suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
+                raise
+
+    def discard_attribution_candidate(self, hash_key: str, compression_event_id: str) -> bool:
+        """Atomically remove one never-emitted producer from a shared row."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT entry_json FROM ccr_entries WHERE hash = ?",
+                    (hash_key,),
+                ).fetchone()
+                entry = self._entry_from_json(row[0]) if row is not None else None
+                retention = max(
+                    _DISCARD_TOMBSTONE_TTL_SECONDS,
+                    int(entry.ttl) if entry is not None else 0,
+                )
+                self._conn.execute(
+                    "INSERT INTO ccr_discarded_events (compression_event_id, expires_at) "
+                    "VALUES (?, ?) ON CONFLICT(compression_event_id) DO UPDATE SET "
+                    "expires_at = MAX(expires_at, excluded.expires_at)",
+                    (compression_event_id, time.time() + retention),
+                )
+                if entry is None:
+                    self._conn.commit()
+                    return False
+                from ..compression_store import _entry_without_compression_event
+
+                replacement, changed = _entry_without_compression_event(entry, compression_event_id)
+                if not changed:
+                    self._conn.commit()
+                    return False
+                if replacement is None:
+                    self._conn.execute("DELETE FROM ccr_entries WHERE hash = ?", (hash_key,))
+                else:
+                    payload = json.dumps(asdict(replacement), ensure_ascii=False)
+                    self._conn.execute(
+                        "UPDATE ccr_entries SET entry_json = ?, created_at = ?, ttl = ? "
+                        "WHERE hash = ?",
+                        (payload, replacement.created_at, replacement.ttl, hash_key),
+                    )
+                self._conn.commit()
+                return True
+            except sqlite3.DatabaseError as e:
+                with contextlib.suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
+                self._handle_db_error(e, "discard attribution candidate")
+                return False
+            except Exception:
+                with contextlib.suppress(sqlite3.DatabaseError):
+                    self._conn.rollback()
+                raise
 
     def delete(self, hash_key: str) -> bool:
         with self._lock:
@@ -222,6 +482,7 @@ class SQLiteBackend:
         with self._lock:
             try:
                 self._conn.execute("DELETE FROM ccr_entries")
+                self._conn.execute("DELETE FROM ccr_discarded_events")
                 self._conn.commit()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "op")
@@ -262,9 +523,14 @@ class SQLiteBackend:
         with self._lock:
             try:
                 count_row = self._conn.execute("SELECT COUNT(*) FROM ccr_entries").fetchone()
+                tombstone_row = self._conn.execute(
+                    "SELECT COUNT(*) FROM ccr_discarded_events WHERE expires_at >= ?",
+                    (time.time(),),
+                ).fetchone()
             except sqlite3.DatabaseError as e:
                 self._handle_db_error(e, "op")
                 count_row = (0,)
+                tombstone_row = (0,)
         try:
             bytes_used = self._path.stat().st_size
         except OSError:
@@ -272,6 +538,7 @@ class SQLiteBackend:
         return {
             "backend_type": "sqlite",
             "entry_count": int(count_row[0]),
+            "discard_tombstone_count": int(tombstone_row[0]),
             "bytes_used": bytes_used,
             "db_path": str(self._path),
         }

@@ -387,7 +387,9 @@ def test_native_responses_route_carries_the_client_decision(
         assert transport.call_count == 1, response.text
         assert response.status_code == 200, response.text
         assert seen, "the Responses compressor was never reached"
-        assert {k: v for k, v in seen[0].items() if k not in {"timing", "savings_tags"}} == expected
+        assert seen[0].get("client") == expected["client"]
+        assert isinstance(seen[0].get("session_id"), str)
+        assert seen[0]["session_id"]
 
 
 # --- production route: the Codex WebSocket handler ---------------------------
@@ -436,7 +438,7 @@ def test_websocket_route_carries_the_client_decision(
     seen: list[dict[str, object]] = []
 
     def _compress(payload, *, model, request_id, **kwargs):  # noqa: ANN001, ANN202
-        seen.append(kwargs)
+        seen.append({"request_id": request_id, **kwargs})
         return (payload, False, 0, [], "router_no_compression", 10, 10)
 
     handler._compress_openai_responses_payload = _compress
@@ -445,4 +447,7 @@ def test_websocket_route_carries_the_client_decision(
         asyncio.run(handler.handle_openai_responses_ws(client_ws))
 
     assert seen, "the Responses compressor was never reached on the WS path"
-    assert {k: v for k, v in seen[0].items() if k != "timing"} == expected
+    assert seen[0].get("client") == expected["client"]
+    assert seen[0]["request_id"] == "req-lifecycle-test:frame:1"
+    assert isinstance(seen[0].get("session_id"), str)
+    assert seen[0]["session_id"]

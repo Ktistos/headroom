@@ -400,6 +400,63 @@ def test_backend_ccr_intercept_exception_is_reraised_not_swallowed():
     assert "ccr-store-blew-up" in body["error"]["message"]
 
 
+def test_backend_ccr_continuation_rejects_non_success_status():
+    config = _make_config()
+    tool_call_response = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_rejected",
+                            "type": "function",
+                            "function": {
+                                "name": "headroom_retrieve",
+                                "arguments": '{"hash":"deadbeef"}',
+                            },
+                        }
+                    ],
+                }
+            }
+        ],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+    }
+    mock_backend = _make_mock_backend(tool_call_response)
+    mock_backend.send_openai_message.side_effect = [
+        BackendResponse(body=tool_call_response, status_code=200),
+        BackendResponse(body={"error": "busy"}, status_code=503, error="busy"),
+    ]
+
+    class _CCRHandler:
+        def has_ccr_tool_calls(self, response, provider):  # noqa: ANN001
+            return True
+
+        async def handle_response(  # noqa: ANN001
+            self, response, messages, tools, api_call_fn, provider
+        ):
+            return await api_call_fn(messages, tools)
+
+    with patch("headroom.proxy.server.AnyLLMBackend", return_value=mock_backend):
+        app = create_app(config)
+        with TestClient(app) as client:
+            _install_tracker_stub(client)
+            client.app.state.proxy.ccr_response_handler = _CCRHandler()
+            response = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+    assert response.status_code == 500
+    assert mock_backend.send_openai_message.await_count == 2
+
+
 def test_backend_streaming_passes_prefix_tracker_through():
     """Streaming backend path should accept and use prefix_tracker — non-regression smoke."""
     # The wiring contract is structural — just confirm the parameter exists.

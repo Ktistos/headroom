@@ -14,9 +14,17 @@ from .compression_units import (
     RoutedCompressionUnit,
     TokenCounterLike,
     UnitCompressionResult,
+    _discard_unemitted_policy_events,
     _is_structured_shell_output,
+    _router_attribution_kwargs,
 )
-from .content_router import RouterCompressionResult
+from .content_router import (
+    PolicySideEffectTransaction,
+    RouterCompressionResult,
+    activate_policy_side_effect_transaction,
+    current_policy_side_effect_transaction,
+    policy_side_effect_transaction,
+)
 from .tag_protector import protect_tags, restore_tags
 
 DEFAULT_MAX_BATCH_BYTES = 2048
@@ -43,7 +51,11 @@ def _text_bytes(text: str) -> int:
     return len(text.encode("utf-8", errors="replace"))
 
 
-def _compatibility_key(entry: CompressionBatchEntry) -> tuple[object, ...]:
+def _compatibility_key(
+    entry: CompressionBatchEntry,
+    *,
+    preserve_tool_call_attribution: bool,
+) -> tuple[object, ...]:
     unit = entry.routed.unit
     return (
         unit.provider,
@@ -54,6 +66,12 @@ def _compatibility_key(entry: CompressionBatchEntry) -> tuple[object, ...]:
         unit.context,
         unit.question,
         unit.bias,
+        unit.metadata.get("tool_name"),
+        unit.metadata.get("tool_context"),
+        unit.metadata.get("session_id"),
+        unit.metadata.get("request_id"),
+        unit.metadata.get("tool_call_id") if preserve_tool_call_attribution else None,
+        unit.metadata.get("provider_slot") if preserve_tool_call_attribution else None,
     )
 
 
@@ -63,6 +81,7 @@ def build_compression_batches(
     min_batch_bytes: int,
     max_batch_bytes: int = DEFAULT_MAX_BATCH_BYTES,
     max_batch_units: int = DEFAULT_MAX_BATCH_UNITS,
+    preserve_tool_call_attribution: bool = False,
 ) -> tuple[list[CompressionBatch], list[CompressionBatchEntry]]:
     """Greedily group compatible small units and skip under-floor tails.
 
@@ -99,7 +118,10 @@ def build_compression_batches(
 
     for entry in entries:
         entry_bytes = _text_bytes(entry.routed.unit.text)
-        entry_key = _compatibility_key(entry)
+        entry_key = _compatibility_key(
+            entry,
+            preserve_tool_call_attribution=preserve_tool_call_attribution,
+        )
         if entry_bytes >= min_batch_bytes or entry_bytes > max_batch_bytes:
             flush()
             skipped.append(entry)
@@ -195,7 +217,10 @@ def _passthrough_batch_results(
     tokenizer: TokenCounterLike,
     reason: str,
     router_result: RouterCompressionResult | None = None,
+    router: ContentRouter | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
+    if router is not None and reason not in {"router_no_change"}:
+        _discard_unemitted_policy_events(router_result, router)
     strategy = (
         router_result.strategy_used.value
         if router_result
@@ -224,6 +249,23 @@ def _passthrough_batch_results(
     ]
 
 
+def _common_batch_metadata(batch: CompressionBatch) -> dict[str, str]:
+    keys = (
+        "tool_name",
+        "tool_context",
+        "session_id",
+        "request_id",
+        "tool_call_id",
+        "provider_slot",
+        "recovery_payload_path",
+    )
+    result: dict[str, str] = {}
+    for key in keys:
+        values = {entry.routed.unit.metadata.get(key, "") for entry in batch.entries}
+        result[key] = values.pop() if len(values) == 1 else ""
+    return result
+
+
 def compress_batch_with_router(
     batch: CompressionBatch,
     *,
@@ -231,7 +273,33 @@ def compress_batch_with_router(
     tokenizer: TokenCounterLike,
     target_ratio: float | None = None,
 ) -> list[tuple[object, UnitCompressionResult]]:
+    with policy_side_effect_transaction():
+        return _compress_batch_with_router_in_transaction(
+            batch,
+            router=router,
+            tokenizer=tokenizer,
+            target_ratio=target_ratio,
+        )
+
+
+def _compress_batch_with_router_in_transaction(
+    batch: CompressionBatch,
+    *,
+    router: ContentRouter,
+    tokenizer: TokenCounterLike,
+    target_ratio: float | None = None,
+) -> list[tuple[object, UnitCompressionResult]]:
     """Compress one tagged batch and split only structurally valid output."""
+    parent_transaction = current_policy_side_effect_transaction()
+    router_transaction = PolicySideEffectTransaction()
+    if parent_transaction is not None:
+        # Keep the router's effects isolated until the complete envelope has
+        # parsed and at least one provider slot will actually be emitted.
+        parent_transaction.register(
+            "batch-router-transaction",
+            commit=router_transaction.commit,
+            discard=router_transaction.discard,
+        )
 
     nonce = _batch_nonce(batch)
     batch_texts, marker_blocks = _protect_ccr_markers(batch, nonce)
@@ -241,13 +309,17 @@ def compress_batch_with_router(
     if target_ratio is not None:
         router._runtime_target_ratio = target_ratio
     try:
-        router_result = router.compress(
-            protected,
-            context=batch.entries[0].routed.unit.context,
-            question=batch.entries[0].routed.unit.question,
-            bias=batch.entries[0].routed.unit.bias,
-        )
+        with activate_policy_side_effect_transaction(router_transaction):
+            router_result = router.compress(
+                protected,
+                context=batch.entries[0].routed.unit.context,
+                question=batch.entries[0].routed.unit.question,
+                bias=batch.entries[0].routed.unit.bias,
+                tool_name=batch.entries[0].routed.unit.metadata.get("tool_name") or None,
+                **_router_attribution_kwargs(router, _common_batch_metadata(batch)),
+            )
     except Exception:
+        router_transaction.discard()
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
@@ -259,40 +331,48 @@ def compress_batch_with_router(
 
     compressed = router_result.compressed
     if not compressed or compressed == protected:
+        router_transaction.discard()
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
             reason="router_no_change",
             router_result=router_result,
+            router=router,
         )
     protected_placeholders = [placeholder for placeholder, _ in protected_blocks]
     protected_placeholders.extend(marker_blocks)
     if any(compressed.count(placeholder) != 1 for placeholder in protected_placeholders):
+        router_transaction.discard()
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
             reason="batch_invalid",
             router_result=router_result,
+            router=router,
         )
 
     restored = restore_tags(compressed, protected_blocks)
     replacements = _parse_batch_envelope(restored, batch, nonce)
     if replacements is None:
+        router_transaction.discard()
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
             reason="batch_invalid",
             router_result=router_result,
+            router=router,
         )
     if any(
         replacements[entry_index].count(placeholder) != 1
         for placeholder, (entry_index, _marker) in marker_blocks.items()
     ):
+        router_transaction.discard()
         return _passthrough_batch_results(
             batch,
             tokenizer=tokenizer,
             reason="batch_invalid",
             router_result=router_result,
+            router=router,
         )
     for placeholder, (entry_index, marker) in marker_blocks.items():
         replacements[entry_index] = replacements[entry_index].replace(placeholder, marker)
@@ -360,4 +440,9 @@ def compress_batch_with_router(
                 reason_category="applied",
             )
         results.append((entry.routed.slot, result))
+    if results and not any(result.modified for _slot, result in results):
+        _discard_unemitted_policy_events(router_result, router)
+        router_transaction.discard()
+    elif parent_transaction is None:
+        router_transaction.commit()
     return results

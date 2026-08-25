@@ -88,6 +88,7 @@ class CompressedContext:
     query_context: str  # The query/context when compression happened
     sample_content: str  # Preview of what was compressed (for relevance matching)
     workspace_key: str  # Stable per-project identity (see ProjectResolver in storage_router)
+    retrieval_handle: str = ""
 
 
 @dataclass
@@ -97,6 +98,7 @@ class ExpansionRecommendation:
     hash_key: str
     reason: str
     relevance_score: float
+    retrieval_handle: str = ""
 
 
 @dataclass
@@ -167,6 +169,7 @@ class ContextTracker:
         compressed_count: int,
         *,
         workspace_key: str,
+        retrieval_handle: str = "",
         query_context: str = "",
         sample_content: str = "",
     ) -> None:
@@ -198,6 +201,7 @@ class ContextTracker:
 
         context = CompressedContext(
             hash_key=hash_key,
+            retrieval_handle=retrieval_handle,
             turn_number=turn_number,
             timestamp=time.time(),
             tool_name=tool_name,
@@ -208,11 +212,13 @@ class ContextTracker:
             workspace_key=workspace_key,
         )
 
-        # Add or update context
-        if hash_key in self._contexts:
-            self._turn_order.remove(hash_key)
-        self._contexts[hash_key] = context
-        self._turn_order.append(hash_key)
+        # Event handles keep identical-content emissions independent. Legacy
+        # markers retain their historical hash-keyed behavior.
+        context_key = retrieval_handle or hash_key
+        if context_key in self._contexts:
+            self._turn_order.remove(context_key)
+        self._contexts[context_key] = context
+        self._turn_order.append(context_key)
 
         # LRU eviction
         while len(self._contexts) > self.config.max_tracked_contexts:
@@ -272,7 +278,7 @@ class ContextTracker:
         recommendations: list[ExpansionRecommendation] = []
         now = time.time()
 
-        for hash_key, context in self._contexts.items():
+        for context in self._contexts.values():
             # Workspace filter — the cross-project leak gate. Skip
             # entries that belong to a different project than the one
             # the current request resolved to.
@@ -294,7 +300,8 @@ class ContextTracker:
             if relevance >= self.config.relevance_threshold:
                 recommendations.append(
                     ExpansionRecommendation(
-                        hash_key=hash_key,
+                        hash_key=context.hash_key,
+                        retrieval_handle=context.retrieval_handle,
                         reason=self._generate_reason(query, context, relevance),
                         relevance_score=relevance,
                     )
@@ -507,15 +514,24 @@ class ContextTracker:
             try:
                 # Retrieval is by hash: proactive expansion always restores the
                 # full original content (no partial/search expansion).
-                entry = store.retrieve(rec.hash_key)
+                entry = store.retrieve_for_internal_use(
+                    rec.hash_key,
+                    retrieval_handle=rec.retrieval_handle or None,
+                )
                 if entry:
                     results.append(
                         {
                             "hash": rec.hash_key,
+                            "retrieval_handle": rec.retrieval_handle,
                             "type": "full",
                             "content": entry.original_content,
                             "item_count": entry.original_item_count,
                             "reason": rec.reason,
+                            "compression_event_id": entry.compression_event_id,
+                            "session_id": entry.session_id,
+                            "request_id": entry.request_id,
+                            "tool_call_id": entry.tool_call_id,
+                            "provider_slot": entry.provider_slot,
                         }
                     )
                     logger.info(
@@ -567,9 +583,93 @@ class ContextTracker:
         body = body.replace("</headroom_proactive_expansion>", "<\\/headroom_proactive_expansion>")
         return f"<headroom_proactive_expansion>\n{body}\n</headroom_proactive_expansion>"
 
+    def account_injected_expansions(
+        self,
+        expansions: list[dict[str, Any]],
+        rendered: str,
+        *,
+        injection_event_id: str | None = None,
+    ) -> None:
+        """Charge and learn only after the formatted block is injected.
+
+        Production callers pass the outbound request ID so retries of the same
+        injection are idempotent. Direct callers without that lifecycle identity
+        receive a fresh bounded-horizon report ID.
+        """
+        if not expansions:
+            return
+        from ..transforms.content_router import defer_policy_side_effect_until_commit
+
+        expansion_snapshot = [dict(expansion) for expansion in expansions]
+
+        def _commit_injection_accounting() -> None:
+            from ..transforms.retrieval_aware_policy import (
+                CompressionCostLedger,
+                RetrievalReportStatus,
+                compression_cost_tracking_enabled,
+                estimate_payload_tokens,
+                get_compression_cost_ledger,
+                stable_retrieval_event_id,
+            )
+
+            tracking_enabled = compression_cost_tracking_enabled()
+            ledger = get_compression_cost_ledger()
+            injection_id = injection_event_id or CompressionCostLedger.new_retrieval_event_id()
+            content_costs = [
+                estimate_payload_tokens(expansion.get("content", ""))
+                for expansion in expansion_snapshot
+            ]
+            envelope = max(estimate_payload_tokens(rendered) - sum(content_costs), 0)
+            store = get_compression_store()
+            for index, (expansion, content_cost) in enumerate(
+                zip(expansion_snapshot, content_costs, strict=True)
+            ):
+                retrieval_event_id = stable_retrieval_event_id(
+                    "proactive",
+                    injection_id,
+                    expansion.get("compression_event_id"),
+                    index,
+                )
+                status = None
+                if tracking_enabled:
+                    status = ledger.record_recovery(
+                        str(expansion.get("hash", "")),
+                        retrieval_event_id=retrieval_event_id,
+                        recovery_payload_tokens=content_cost + (envelope if index == 0 else 0),
+                        compression_event_id=expansion.get("compression_event_id"),
+                        session_id=expansion.get("session_id"),
+                        request_id=expansion.get("request_id"),
+                        tool_call_id=expansion.get("tool_call_id"),
+                        provider_slot=expansion.get("provider_slot"),
+                    )
+                # A fail-closed accounting result must not leak into the
+                # legacy CompressionStore/TOIN learner. Unattributed remains a
+                # legitimate delivered recovery whose ledger event may simply
+                # have aged out; duplicates and rejected reports teach nothing.
+                commit_feedback = (
+                    status
+                    in {
+                        RetrievalReportStatus.ATTRIBUTED,
+                        RetrievalReportStatus.UNATTRIBUTED,
+                    }
+                    if tracking_enabled
+                    else ledger.claim_feedback_report(retrieval_event_id)
+                )
+                if commit_feedback:
+                    store.retrieve(
+                        str(expansion.get("hash", "")),
+                        retrieval_handle=expansion.get("retrieval_handle") or None,
+                        compression_event_id=expansion.get("compression_event_id"),
+                    )
+
+        defer_policy_side_effect_until_commit(
+            _commit_injection_accounting,
+            label="proactive-model-injection",
+        )
+
     def get_tracked_hashes(self) -> list[str]:
-        """Get list of currently tracked hashes."""
-        return list(self._contexts.keys())
+        """Get hashes for currently tracked compression events."""
+        return [context.hash_key for context in self._contexts.values()]
 
     def get_stats(self) -> dict[str, Any]:
         """Get tracker statistics."""

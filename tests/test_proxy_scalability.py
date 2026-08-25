@@ -246,6 +246,27 @@ class TestWorkerConfiguration:
         config = uvicorn.Config(app="app:app")
         assert config.workers is None or config.workers == 1
 
+    def test_retrieval_aware_mode_disables_speculative_background_compression(self, monkeypatch):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import create_app
+
+        monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "control")
+        monkeypatch.setenv("HEADROOM_BACKGROUND_COMPRESSION", "true")
+
+        proxy = create_app(ProxyConfig()).state.proxy
+
+        router = proxy.anthropic_pipeline.transforms[-1]
+        assert router._retrieval_aware_policy is not None
+        assert proxy._background_compression_enabled is False
+
+    def test_retrieval_aware_mode_rejects_multiple_workers(self, monkeypatch):
+        from headroom.proxy.models import ProxyConfig
+        from headroom.proxy.server import run_server
+
+        monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "control")
+        with pytest.raises(ValueError, match="requires --workers 1"):
+            run_server(ProxyConfig(), workers=2, print_banner=False)
+
     def test_run_server_uses_import_string_for_multiple_workers(self, monkeypatch):
         from headroom.proxy.models import ProxyConfig
         from headroom.proxy.server import _MULTI_WORKER_CONFIG_ENV, run_server

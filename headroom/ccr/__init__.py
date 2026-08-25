@@ -62,6 +62,7 @@ from .tool_injection import (
     create_ccr_tool_definition,
     create_system_instructions,
     parse_tool_call,
+    parse_tool_call_reference,
 )
 
 # MCP server is optional (requires mcp package)
@@ -81,6 +82,7 @@ __all__ = [
     "create_ccr_tool_definition",
     "create_system_instructions",
     "parse_tool_call",
+    "parse_tool_call_reference",
     # Response handling
     "CCRResponseHandler",
     "CCRToolCall",

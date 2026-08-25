@@ -667,10 +667,20 @@ async def test_ws_later_frame_compression_is_actually_forwarded(monkeypatch):
 
     compressed_inner = {"model": "gpt-5.4", "input": "compressed"}
     calls = 0
+    scopes: list[tuple[str, str | None]] = []
 
-    def _compress(payload, *, model, request_id, timing=None, client=None):
+    def _compress(
+        payload,
+        *,
+        model,
+        request_id,
+        session_id=None,
+        timing=None,
+        client=None,
+    ):
         nonlocal calls
         calls += 1
+        scopes.append((request_id, session_id))
         if calls == 1:
             # First frame: not modified (exercises the other call site).
             return payload, False, 0, [], "router_no_compression", 10, 10, 0
@@ -703,6 +713,191 @@ async def test_ws_later_frame_compression_is_actually_forwarded(monkeypatch):
     # proof the "modified" branch executed rather than short-circuiting.
     modified_frames = [frame for frame in handler.metrics.codex_ws_frames if frame.get("modified")]
     assert modified_frames, "expected at least one frame recorded as modified=True"
+    assert scopes == [
+        ("req-lifecycle-test:frame:1", scopes[0][1]),
+        ("req-lifecycle-test:frame:2", scopes[0][1]),
+    ]
+    assert scopes[0][1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_accepts", [True, False])
+async def test_ws_policy_effects_wait_for_response_created(monkeypatch, provider_accepts):
+    from headroom.transforms.content_router import (
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+        current_policy_side_effect_transaction,
+    )
+
+    upstream_events = (
+        [
+            json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+            json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+        ]
+        if provider_accepts
+        else []
+    )
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(frames=[_first_frame()], hold_after_initial=True)
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    effects: list[str] = []
+
+    def _compress(payload, **_kwargs):
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        transaction.register(
+            "ws-policy-event",
+            commit=lambda: effects.append("commit"),
+            discard=lambda: effects.append("discard"),
+        )
+        return payload, False, 0, [], "router_no_compression", 10, 10, 0
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+    holder = RequestPolicySideEffectHolder()
+
+    with (
+        activate_request_policy_side_effect_holder(holder),
+        patch.dict(sys.modules, {"websockets": fake_ws_mod}),
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+        holder.finalize(commit=False)
+
+    assert effects == ["commit" if provider_accepts else "discard"]
+
+
+@pytest.mark.asyncio
+async def test_ws_later_policy_effect_is_staged_before_provider_acknowledgement():
+    from headroom.transforms.content_router import (
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+        current_policy_side_effect_transaction,
+    )
+
+    class InterleavedUpstream(_FakeUpstream):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.second_send_started = asyncio.Event()
+            self.release_second_send = asyncio.Event()
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+            if len(self.sent) == 2:
+                self.second_send_started.set()
+                await self.release_second_send.wait()
+
+        async def _iter(self):
+            yield json.dumps({"type": "response.created", "response": {"id": "r_1"}})
+            await self.second_send_started.wait()
+            yield json.dumps({"type": "response.created", "response": {"id": "r_2"}})
+            self.release_second_send.set()
+
+    upstream = InterleavedUpstream()
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), _first_frame()],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    effects: list[str] = []
+    call_index = 0
+
+    def _compress(payload, **_kwargs):
+        nonlocal call_index
+        call_index += 1
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        event = f"ws-policy-event-{call_index}"
+        transaction.register(
+            event,
+            commit=lambda event=event: effects.append(f"commit:{event}"),
+            discard=lambda event=event: effects.append(f"discard:{event}"),
+        )
+        return payload, False, 0, [], "router_no_compression", 10, 10, 0
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+    holder = RequestPolicySideEffectHolder()
+
+    with (
+        activate_request_policy_side_effect_holder(holder),
+        patch.dict(sys.modules, {"websockets": fake_ws_mod}),
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+        holder.finalize(commit=False)
+
+    assert effects == [
+        "commit:ws-policy-event-1",
+        "commit:ws-policy-event-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ws_terminal_event_does_not_discard_next_unaccepted_policy_effect():
+    from headroom.transforms.content_router import (
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+        current_policy_side_effect_transaction,
+    )
+
+    class InterleavedUpstream(_FakeUpstream):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.second_send_started = asyncio.Event()
+            self.release_second_send = asyncio.Event()
+
+        async def send(self, payload: str) -> None:
+            self.sent.append(payload)
+            if len(self.sent) == 2:
+                self.second_send_started.set()
+                await self.release_second_send.wait()
+
+        async def _iter(self):
+            yield json.dumps({"type": "response.created", "response": {"id": "r_1"}})
+            await self.second_send_started.wait()
+            yield json.dumps({"type": "response.failed", "response": {"id": "r_1"}})
+            yield json.dumps({"type": "response.created", "response": {"id": "r_2"}})
+            self.release_second_send.set()
+
+    upstream = InterleavedUpstream()
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), _first_frame()],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    effects: list[str] = []
+    call_index = 0
+
+    def _compress(payload, **_kwargs):
+        nonlocal call_index
+        call_index += 1
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        event = f"ws-policy-event-{call_index}"
+        transaction.register(
+            event,
+            commit=lambda event=event: effects.append(f"commit:{event}"),
+            discard=lambda event=event: effects.append(f"discard:{event}"),
+        )
+        return payload, False, 0, [], "router_no_compression", 10, 10, 0
+
+    handler._compress_openai_responses_payload = _compress  # type: ignore[method-assign]
+    holder = RequestPolicySideEffectHolder()
+
+    with (
+        activate_request_policy_side_effect_holder(holder),
+        patch.dict(sys.modules, {"websockets": fake_ws_mod}),
+    ):
+        await handler.handle_openai_responses_ws(client_ws)
+        holder.finalize(commit=False)
+
+    assert effects == [
+        "commit:ws-policy-event-1",
+        "commit:ws-policy-event-2",
+    ]
 
 
 @pytest.mark.asyncio

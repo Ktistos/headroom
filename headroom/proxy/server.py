@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import contextvars
 import hmac
 import ipaddress
 import json
@@ -77,7 +78,7 @@ from headroom.ccr import (
     ContextTracker,
     ContextTrackerConfig,
     ResponseHandlerConfig,
-    parse_tool_call,
+    parse_tool_call_reference,
 )
 from headroom.config import (
     DEFAULT_EXCLUDE_TOOLS,
@@ -470,6 +471,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("headroom.proxy")
 
+_RETRIEVAL_AWARE_ENABLED_MODES = frozenset(
+    {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "control",
+        "observe",
+        "shadow",
+        "always_lossless",
+        "always_lossy",
+        "historical",
+    }
+)
+
 
 class _SuppressCancelledErrorFilter(logging.Filter):
     """Hide expected uvicorn CancelledError tracebacks during shutdown."""
@@ -833,6 +849,28 @@ class HeadroomProxy(
         # ContentRouter is the single proxy routing surface. Provider handlers
         # normalize their request shapes into messages or CompressionUnits, and
         # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
+        retrieval_aware_mode = os.environ.get("HEADROOM_RETRIEVAL_AWARE", "").strip().lower()
+        retrieval_aware_observe = retrieval_aware_mode in {"observe", "shadow"}
+        retrieval_aware_forced_action = (
+            "lossless"
+            if retrieval_aware_mode == "always_lossless"
+            else "lossy"
+            if retrieval_aware_mode in {"always_lossy", "historical"}
+            else None
+        )
+        retrieval_aware_enabled = retrieval_aware_mode in _RETRIEVAL_AWARE_ENABLED_MODES
+        # The ledger switch is process-wide because recovery can arrive through
+        # provider handlers, the store, or a sibling MCP process rather than the
+        # router that made the decision. Proxy construction owns its complete
+        # lifecycle: an explicitly disabled/default proxy must reset state left
+        # by an earlier enabled instance in the same process (notably tests and
+        # embedded deployments). Constructing a standalone ContentRouter must
+        # not make this global switch sticky.
+        from headroom.transforms.retrieval_aware_policy import (
+            enable_compression_cost_tracking,
+        )
+
+        enable_compression_cost_tracking(retrieval_aware_enabled)
         profile_kwargs = proxy_pipeline_kwargs(config)
         router_config = ContentRouterConfig(
             enable_code_aware=config.code_aware_enabled,
@@ -850,6 +888,9 @@ class HeadroomProxy(
             ccr_inject_marker=config.ccr_inject_marker,
             force_kompress_all=config.force_kompress_all,
             lossless=config.lossless,
+            retrieval_aware_enabled=retrieval_aware_enabled,
+            retrieval_aware_observe_only=retrieval_aware_observe,
+            retrieval_aware_forced_action=retrieval_aware_forced_action,
         )
         # Compressor selection (opt-in). None keeps every built-in enabled
         # (default, byte-identical to today); a selection maps the recognized
@@ -1118,6 +1159,18 @@ class HeadroomProxy(
         self._background_compression_enabled: bool = os.environ.get(
             "HEADROOM_BACKGROUND_COMPRESSION", ""
         ).strip().lower() in ("1", "true", "yes", "on")
+        if retrieval_aware_enabled and self._background_compression_enabled:
+            # A background result is only a speculative cache candidate: it may
+            # never be emitted, and the startup drain does not own the eventual
+            # request's tenant-scoped CCR store. Recording a policy event here
+            # would therefore learn from and publish an unobserved marker. Keep
+            # retrieval-aware compression synchronous until cache adoption can
+            # commit the event transaction at the actual emission boundary.
+            self._background_compression_enabled = False
+            logger.warning(
+                "Background compression disabled while retrieval-aware compression is active; "
+                "off-path results do not have a trustworthy emission boundary"
+            )
         try:
             self._background_compression_min_tokens: int = int(
                 os.environ.get("HEADROOM_BACKGROUND_COMPRESSION_MIN_TOKENS", "50000")
@@ -1462,13 +1515,18 @@ class HeadroomProxy(
                 f"compression quarantined: {timed_out_in_flight} timed-out worker(s) still running"
             )
 
+        from headroom.transforms.content_router import current_policy_side_effect_transaction
+
         loop = asyncio.get_running_loop()
+        parent_transaction = current_policy_side_effect_transaction()
+        caller_context = contextvars.copy_context()
         queued_at = time.monotonic()
         state = {
             "queued": True,
             "started": False,
             "finished": False,
             "timed_out": False,
+            "cancelled": False,
             "timeout_debt_recorded": False,
         }
         with self._compression_metrics_lock:
@@ -1514,9 +1572,16 @@ class HeadroomProxy(
             )
 
         def _wrapped():  # noqa: ANN202
+            from headroom.transforms.content_router import (
+                PolicySideEffectTransaction,
+                activate_policy_side_effect_transaction,
+            )
+
+            transaction = PolicySideEffectTransaction()
             started_at = time.monotonic()
             queue_wait = started_at - queued_at
             with self._compression_metrics_lock:
+                state["policy_transaction"] = transaction
                 state["started"] = True
                 if state["queued"]:
                     self._compression_queued -= 1
@@ -1530,9 +1595,22 @@ class HeadroomProxy(
                 quarantine_activated = _record_timeout_debt_locked()
             if quarantine_activated:
                 _announce_quarantine()
+            if state["timed_out"] or state["cancelled"]:
+                transaction.discard()
+
+            def _run_in_caller_context():  # noqa: ANN202
+                with activate_policy_side_effect_transaction(transaction):
+                    return fn()
+
             try:
-                return fn()
+                result = caller_context.run(_run_in_caller_context)
+                return result, transaction
+            except BaseException:
+                transaction.discard()
+                raise
             finally:
+                if state["timed_out"] or state["cancelled"]:
+                    transaction.discard()
                 elapsed = time.monotonic() - started_at
                 with self._compression_metrics_lock:
                     state["finished"] = True
@@ -1553,17 +1631,34 @@ class HeadroomProxy(
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            result, transaction = await asyncio.wait_for(future, timeout=timeout)
+            if parent_transaction is not None:
+                parent_transaction.merge_from(transaction)
+            else:
+                # SDK/direct callers have no provider lifecycle owner; completion
+                # of the compression call remains their adoption boundary.
+                transaction.commit()
+            return result
         except asyncio.TimeoutError:
             with self._compression_metrics_lock:
                 state["timed_out"] = True
+                transaction = state.get("policy_transaction")
                 if state["queued"]:
                     self._compression_queued -= 1
                     state["queued"] = False
                     self._compression_queue_timeouts += 1
                 quarantine_activated = _record_timeout_debt_locked()
+            if transaction is not None:
+                transaction.discard()
             if quarantine_activated:
                 _announce_quarantine()
+            raise
+        except asyncio.CancelledError:
+            with self._compression_metrics_lock:
+                state["cancelled"] = True
+                transaction = state.get("policy_transaction")
+            if transaction is not None:
+                transaction.discard()
             raise
 
     async def _run_compression_background(self, fn):  # noqa: ANN001, ANN201
@@ -2456,6 +2551,22 @@ class WebSocketProjectPrefixMiddleware:
                 name.decode("latin-1"): value.decode("latin-1") for name, value in scope["headers"]
             }
             set_current_project(classify_project(headers) or prefix_project)
+            retrieval_aware_mode = os.environ.get("HEADROOM_RETRIEVAL_AWARE", "").strip().lower()
+            if retrieval_aware_mode in _RETRIEVAL_AWARE_ENABLED_MODES:
+                from headroom.transforms.content_router import (
+                    RequestPolicySideEffectHolder,
+                    activate_request_policy_side_effect_holder,
+                )
+
+                holder = RequestPolicySideEffectHolder()
+                with activate_request_policy_side_effect_holder(holder):
+                    try:
+                        await self.app(scope, receive, send)
+                    finally:
+                        # Successfully forwarded frames commit and renew explicitly.
+                        # Anything left belongs to a failed or never-sent frame.
+                        holder.finalize(commit=False)
+                return
         await self.app(scope, receive, send)
 
 
@@ -3225,9 +3336,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     proxy.metrics.record_stack(stack)
                 except Exception:
                     logger.debug("record_stack failed", exc_info=True)
+
+        policy_holder = None
+        retrieval_aware_mode = os.environ.get("HEADROOM_RETRIEVAL_AWARE", "").strip().lower()
+        if retrieval_aware_mode in _RETRIEVAL_AWARE_ENABLED_MODES:
+            from headroom.transforms.content_router import (
+                RequestPolicySideEffectHolder,
+                activate_request_policy_side_effect_holder,
+            )
+
+            policy_holder = RequestPolicySideEffectHolder()
+
+        async def _call_next_with_policy_lifecycle():  # noqa: ANN202
+            if policy_holder is None:
+                return await call_next(request)
+            with activate_request_policy_side_effect_holder(policy_holder):
+                return await call_next(request)
+
         try:
-            response = await call_next(request)
+            response = await _call_next_with_policy_lifecycle()
         except asyncio.CancelledError:
+            if policy_holder is not None:
+                policy_holder.finalize(commit=False)
             try:
                 proxy.metrics.record_inbound_aborted(reason="cancelled")
             except Exception:
@@ -3242,6 +3372,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
             raise
         except Exception as exc:
+            if policy_holder is not None:
+                policy_holder.finalize(commit=False)
             try:
                 proxy.metrics.record_inbound_aborted(reason=type(exc).__name__)
             except Exception:
@@ -3257,6 +3389,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 exc_info=True,
             )
             raise
+        if policy_holder is not None:
+            # A provider 4xx/5xx means no model turn accepted the transformed
+            # input. Finalize only successful endpoint responses.
+            policy_holder.finalize(commit=200 <= response.status_code < 300)
         try:
             proxy.metrics.record_inbound_response(status_code=response.status_code)
         except Exception:
@@ -4584,51 +4720,185 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # CCR (Compress-Cache-Retrieve) endpoints
     @app.post("/v1/retrieve", dependencies=[Depends(_require_loopback)])
     async def ccr_retrieve(request: Request):
-        """Retrieve original content from CCR compression cache.
+        """Return raw CCR data over loopback HTTP.
 
-        This is the "Retrieve" part of CCR (Compress-Cache-Retrieve).
-        When SmartCrusher compresses tool outputs, the original data is cached.
-        LLMs can call this endpoint to get more data if needed.
-
-        Request body:
-            hash (str): Hash key from compression marker (required)
-
-        Response:
-            {"hash": "...", "original_content": "...", ...}
+        This response is client transport, not proof that the payload entered a
+        model turn, so it never changes payload-net savings or retrieval priors.
+        ``account_recovery`` is accepted as a deprecated no-op.
         """
         data = await request.json()
         hash_key = data.get("hash")
-
         if not hash_key:
             raise HTTPException(status_code=400, detail="hash required")
-
         store = get_compression_store()
-
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
         if entry_status["status"] != "available":
+            raise HTTPException(status_code=404, detail=format_retrieval_miss_detail(entry_status))
+        reference_status = store.get_retrieval_reference_status(
+            hash_key,
+            retrieval_handle=data.get("handle"),
+            compression_event_id=data.get("compression_event_id"),
+            session_id=data.get("session_id"),
+            request_id=data.get("request_id"),
+            tool_call_id=data.get("tool_call_id"),
+            provider_slot=data.get("provider_slot"),
+        )
+        if reference_status["status"] != "available":
+            retrieval_event_id = data.get("retrieval_event_id")
+            if retrieval_event_id and reference_status["status"] in {"ambiguous", "unresolved"}:
+                from headroom.transforms.retrieval_aware_policy import (
+                    compression_cost_tracking_enabled,
+                    get_compression_cost_ledger,
+                )
+
+                if compression_cost_tracking_enabled():
+                    get_compression_cost_ledger().record_rejected_retrieval_attempt(
+                        hash_key,
+                        retrieval_event_id=str(retrieval_event_id),
+                        ambiguous=reference_status["status"] == "ambiguous",
+                    )
             raise HTTPException(
-                status_code=404,
-                detail=format_retrieval_miss_detail(entry_status),
+                status_code=409 if reference_status["status"] == "ambiguous" else 404,
+                detail=f"retrieval reference {reference_status['status']}",
+            )
+        entry = store.retrieve_for_internal_use(
+            hash_key,
+            retrieval_handle=data.get("handle"),
+            compression_event_id=data.get("compression_event_id"),
+            session_id=data.get("session_id"),
+            request_id=data.get("request_id"),
+            tool_call_id=data.get("tool_call_id"),
+            provider_slot=data.get("provider_slot"),
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail="retrieval reference did not resolve")
+        response_payload = {
+            "hash": hash_key,
+            "handle": entry.retrieval_handle,
+            "original_content": entry.original_content,
+            "original_tokens": entry.original_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            "tool_name": entry.tool_name,
+            "retrieval_count": entry.retrieval_count,
+            "compression_event_id": entry.compression_event_id,
+            "accounting_boundary": "http_transport_only",
+        }
+        from headroom.transforms.retrieval_aware_policy import (
+            compression_cost_tracking_enabled,
+            estimate_payload_tokens,
+            get_compression_cost_ledger,
+        )
+
+        if compression_cost_tracking_enabled():
+            get_compression_cost_ledger().record_http_transport_retrieval(
+                estimate_payload_tokens(response_payload)
+            )
+        return response_payload
+
+    @app.post("/v1/retrieve/account", dependencies=[Depends(_require_loopback)])
+    async def ccr_account_local_retrieval(request: Request):
+        """Idempotently attribute a payload returned by a local MCP process.
+
+        The peer-socket/Host loopback dependency is authoritative; forwarded
+        headers are ignored. When HEADROOM_RETRIEVAL_ACCOUNT_SECRET is unset,
+        every loopback process is trusted. A configured secret must match.
+        """
+        expected_secret = os.environ.get("HEADROOM_RETRIEVAL_ACCOUNT_SECRET", "")
+        supplied_secret = request.headers.get("x-headroom-retrieval-account-secret", "")
+        if expected_secret and not hmac.compare_digest(expected_secret, supplied_secret):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        data = await request.json()
+        hash_key = data.get("hash")
+        retrieval_event_id = data.get("retrieval_event_id")
+        if not isinstance(hash_key, str) or not hash_key:
+            raise HTTPException(status_code=400, detail="hash required")
+        if not isinstance(retrieval_event_id, str) or not retrieval_event_id:
+            raise HTTPException(status_code=400, detail="retrieval_event_id required")
+        try:
+            recovery_payload_tokens = int(data.get("recovery_payload_tokens", -1))
+        except (TypeError, ValueError):
+            recovery_payload_tokens = -1
+        if recovery_payload_tokens < 0:
+            raise HTTPException(
+                status_code=400, detail="recovery_payload_tokens must be non-negative"
             )
 
-        # Retrieval is by hash: always return the full original content.
-        entry = store.retrieve(hash_key)
-        if entry:
-            return {
-                "hash": hash_key,
-                "original_content": entry.original_content,
-                "original_tokens": entry.original_tokens,
-                "original_item_count": entry.original_item_count,
-                "compressed_item_count": entry.compressed_item_count,
-                "tool_name": entry.tool_name,
-                "retrieval_count": entry.retrieval_count,
-            }
-        raise HTTPException(
-            status_code=404,
-            detail=format_retrieval_miss_detail(
-                store.get_entry_status(hash_key, clean_expired=True)
-            ),
+        from headroom.transforms.retrieval_aware_policy import (
+            compression_cost_tracking_enabled,
+            get_compression_cost_ledger,
         )
+
+        rejected_reason = str(data.get("rejected_reason") or "")
+        if not compression_cost_tracking_enabled():
+            # The retrieval-aware ledger may be disabled while legacy CCR/TOIN
+            # feedback is still enabled. Commit that feedback only at this
+            # explicit post-injection boundary, and claim the event ID in the
+            # same bounded LRU so a client retry cannot teach it twice.
+            ledger = get_compression_cost_ledger()
+            first_report = ledger.claim_feedback_report(retrieval_event_id)
+            feedback_committed = False
+            if first_report and not rejected_reason:
+                feedback_entry = get_compression_store().retrieve(
+                    hash_key,
+                    compression_event_id=data.get("compression_event_id"),
+                    retrieval_handle=data.get("retrieval_handle"),
+                    session_id=data.get("session_id"),
+                    request_id=data.get("request_id"),
+                    tool_call_id=data.get("tool_call_id"),
+                    provider_slot=data.get("provider_slot"),
+                )
+                feedback_committed = feedback_entry is not None
+            return {
+                "enabled": False,
+                "attributed": False,
+                "status": "disabled" if first_report else "duplicate",
+                "feedback_committed": feedback_committed,
+            }
+        if rejected_reason in {"ambiguous", "unresolved"}:
+            status = get_compression_cost_ledger().record_rejected_retrieval_attempt(
+                hash_key,
+                retrieval_event_id=retrieval_event_id,
+                ambiguous=rejected_reason == "ambiguous",
+            )
+        else:
+            status = get_compression_cost_ledger().record_recovery(
+                hash_key,
+                retrieval_event_id=retrieval_event_id,
+                recovery_payload_tokens=recovery_payload_tokens,
+                compression_event_id=data.get("compression_event_id"),
+                session_id=data.get("session_id"),
+                request_id=data.get("request_id"),
+                tool_call_id=data.get("tool_call_id"),
+                provider_slot=data.get("provider_slot"),
+            )
+        feedback_committed = False
+        # A rejected report is intentionally fail-closed (for example after
+        # a legacy hash-only idempotency hazard). Do not let the legacy
+        # CompressionStore/TOIN path learn from an event the accounting layer
+        # refused to identify. An unattributed report may still represent a
+        # genuine delivered recovery whose older ledger event was evicted.
+        if not rejected_reason and status.value in {"attributed", "unattributed"}:
+            feedback_entry = get_compression_store().retrieve(
+                hash_key,
+                compression_event_id=data.get("compression_event_id"),
+                retrieval_handle=data.get("retrieval_handle"),
+                session_id=data.get("session_id"),
+                request_id=data.get("request_id"),
+                tool_call_id=data.get("tool_call_id"),
+                provider_slot=data.get("provider_slot"),
+            )
+            feedback_committed = feedback_entry is not None
+        return {
+            "enabled": True,
+            "attributed": status.value == "attributed",
+            "status": status.value,
+            "hash": hash_key,
+            "retrieval_event_id": retrieval_event_id,
+            "recovery_payload_tokens": recovery_payload_tokens,
+            "feedback_committed": feedback_committed,
+        }
 
     @app.get("/v1/retrieve/stats", dependencies=[Depends(_require_loopback)])
     async def ccr_stats():
@@ -4636,8 +4906,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         store = get_compression_store()
         stats = store.get_stats()
         events = store.get_retrieval_events(limit=20)
+        from headroom.transforms.retrieval_aware_policy import (
+            compression_cost_tracking_enabled,
+            get_compression_cost_ledger,
+        )
+
+        ledger_stats = (
+            get_compression_cost_ledger().snapshot()
+            if compression_cost_tracking_enabled()
+            else {"enabled": False}
+        )
         return {
             "store": stats,
+            "retrieval_aware": {
+                "enabled": compression_cost_tracking_enabled(),
+                "ledger": ledger_stats,
+            },
+            "realized_cost": {
+                "deprecated": True,
+                "replacement": "retrieval_aware.ledger",
+                **ledger_stats,
+            },
             "recent_retrievals": [
                 {
                     "hash": e.hash,
@@ -4920,122 +5209,124 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
 
     @app.get("/v1/retrieve/{hash_key}", dependencies=[Depends(_require_loopback)])
-    async def ccr_retrieve_get(hash_key: str):
-        """GET version of CCR retrieve for easier testing."""
+    async def ccr_retrieve_get(hash_key: str, handle: str | None = None):
+        """GET raw CCR transport; model-input accounting is intentionally separate."""
         store = get_compression_store()
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
-
         if entry_status["status"] != "available":
+            raise HTTPException(status_code=404, detail=format_retrieval_miss_detail(entry_status))
+        reference_status = store.get_retrieval_reference_status(hash_key, retrieval_handle=handle)
+        if reference_status["status"] != "available":
             raise HTTPException(
-                status_code=404,
-                detail=format_retrieval_miss_detail(entry_status),
+                status_code=409 if reference_status["status"] == "ambiguous" else 404,
+                detail=f"retrieval reference {reference_status['status']}",
             )
-
-        # Retrieval is by hash: always return the full original content.
-        entry = store.retrieve(hash_key)
-        if entry:
-            return {
-                "hash": hash_key,
-                "original_content": entry.original_content,
-                "original_tokens": entry.original_tokens,
-                "original_item_count": entry.original_item_count,
-                "compressed_item_count": entry.compressed_item_count,
-                "tool_name": entry.tool_name,
-                "retrieval_count": entry.retrieval_count,
-            }
-        raise HTTPException(
-            status_code=404,
-            detail=format_retrieval_miss_detail(
-                store.get_entry_status(hash_key, clean_expired=True)
-            ),
+        entry = store.retrieve_for_internal_use(hash_key, retrieval_handle=handle)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="retrieval reference did not resolve")
+        response_payload = {
+            "hash": hash_key,
+            "handle": entry.retrieval_handle,
+            "original_content": entry.original_content,
+            "original_tokens": entry.original_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            "tool_name": entry.tool_name,
+            "retrieval_count": entry.retrieval_count,
+            "compression_event_id": entry.compression_event_id,
+            "accounting_boundary": "http_transport_only",
+        }
+        from headroom.transforms.retrieval_aware_policy import (
+            compression_cost_tracking_enabled,
+            estimate_payload_tokens,
+            get_compression_cost_ledger,
         )
+
+        if compression_cost_tracking_enabled():
+            get_compression_cost_ledger().record_http_transport_retrieval(
+                estimate_payload_tokens(response_payload)
+            )
+        return response_payload
 
     # CCR Tool Call Handler - for agent frameworks to call when LLM uses headroom_retrieve
     @app.post("/v1/retrieve/tool_call", dependencies=[Depends(_require_loopback)])
     async def ccr_handle_tool_call(request: Request):
-        """Handle a CCR tool call from an LLM response.
-
-        This endpoint accepts tool call formats from various providers and returns
-        a properly formatted tool result. Agent frameworks can use this to handle
-        CCR tool calls without implementing the retrieval logic themselves.
-
-        Request body (Anthropic format):
-            {
-                "tool_call": {
-                    "id": "toolu_123",
-                    "name": "headroom_retrieve",
-                    "input": {"hash": "abc123"}
-                },
-                "provider": "anthropic"
-            }
-
-        Request body (OpenAI format):
-            {
-                "tool_call": {
-                    "id": "call_123",
-                    "function": {
-                        "name": "headroom_retrieve",
-                        "arguments": "{\"hash\": \"abc123\"}"
-                    }
-                },
-                "provider": "openai"
-            }
-
-        Response:
-            {
-                "tool_result": {...},  # Formatted for the provider
-                "success": true,
-                "data": {...}  # Raw retrieval data
-            }
-        """
+        """Return a provider result plus a post-injection accounting report."""
         data = await request.json()
         tool_call = data.get("tool_call", {})
         provider = data.get("provider", "anthropic")
-
-        # Parse the tool call
-        hash_key = parse_tool_call(tool_call, provider)
-
-        if hash_key is None:
+        reference = parse_tool_call_reference(tool_call, provider)
+        if reference is None:
             raise HTTPException(
                 status_code=400, detail=f"Invalid tool call or not a {CCR_TOOL_NAME} call"
             )
+        hash_key = reference.hash_key
+        if provider == "google":
+            function_call = tool_call.get("functionCall") or {}
+            tool_call_id = str(function_call.get("id") or function_call.get("name") or "")
+        elif provider == "openai_responses":
+            tool_call_id = str(tool_call.get("call_id") or tool_call.get("id") or "")
+        else:
+            tool_call_id = str(tool_call.get("id") or "")
 
-        # Perform retrieval
+        from headroom.transforms.retrieval_aware_policy import stable_retrieval_event_id
+
+        retrieval_event_id = stable_retrieval_event_id(
+            "http_tool_call",
+            provider,
+            tool_call_id,
+            hash_key,
+            reference.retrieval_handle,
+        )
         store = get_compression_store()
         entry_status = store.get_entry_status(hash_key, clean_expired=True)
+        reference_status = (
+            store.get_retrieval_reference_status(
+                hash_key,
+                retrieval_handle=reference.retrieval_handle or None,
+            )
+            if entry_status["status"] == "available"
+            else entry_status
+        )
+        entry = None
+        if reference_status["status"] == "available":
+            entry = store.retrieve_for_internal_use(
+                hash_key,
+                retrieval_handle=reference.retrieval_handle or None,
+            )
+        elif reference_status["status"] in {"ambiguous", "unresolved"}:
+            from headroom.transforms.retrieval_aware_policy import (
+                compression_cost_tracking_enabled,
+                get_compression_cost_ledger,
+            )
 
-        if entry_status["status"] != "available":
+            if compression_cost_tracking_enabled():
+                get_compression_cost_ledger().record_rejected_retrieval_attempt(
+                    hash_key,
+                    retrieval_event_id=retrieval_event_id,
+                    ambiguous=reference_status["status"] == "ambiguous",
+                )
+        if entry is not None:
             retrieval_data = {
-                "error": format_retrieval_miss_detail(entry_status),
                 "hash": hash_key,
-                "status": entry_status["status"],
-                "ttl_seconds": entry_status.get("ttl_seconds", entry_status["default_ttl_seconds"]),
+                "original_content": entry.original_content,
+                "original_item_count": entry.original_item_count,
+                "compressed_item_count": entry.compressed_item_count,
             }
         else:
-            # Retrieval is by hash: always return the full original content.
-            entry = store.retrieve(hash_key)
-            if entry:
-                retrieval_data = {
-                    "hash": hash_key,
-                    "original_content": entry.original_content,
-                    "original_item_count": entry.original_item_count,
-                    "compressed_item_count": entry.compressed_item_count,
-                }
-            else:
-                miss_status = store.get_entry_status(hash_key, clean_expired=True)
-                retrieval_data = {
-                    "error": format_retrieval_miss_detail(miss_status),
-                    "hash": hash_key,
-                    "status": miss_status["status"],
-                    "ttl_seconds": miss_status.get(
-                        "ttl_seconds", miss_status["default_ttl_seconds"]
-                    ),
-                }
-
-        # Format tool result for provider
-        tool_call_id = tool_call.get("id", "")
+            retrieval_data = {
+                "error": (
+                    f"retrieval reference {reference_status['status']}"
+                    if entry_status["status"] == "available"
+                    else format_retrieval_miss_detail(entry_status)
+                ),
+                "hash": hash_key,
+                "status": reference_status["status"],
+                "ttl_seconds": entry_status.get(
+                    "ttl_seconds", entry_status.get("default_ttl_seconds")
+                ),
+            }
         result_content = json.dumps(retrieval_data, indent=2)
-
         if provider == "anthropic":
             tool_result = {
                 "type": "tool_result",
@@ -5048,17 +5339,60 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "tool_call_id": tool_call_id,
                 "content": result_content,
             }
-        else:
+        elif provider == "openai_responses":
             tool_result = {
-                "tool_call_id": tool_call_id,
-                "content": result_content,
+                "type": "function_call_output",
+                "call_id": tool_call_id,
+                "output": result_content,
             }
-
-        return {
+        elif provider == "google":
+            tool_result = {
+                "functionResponse": {
+                    "name": str((tool_call.get("functionCall") or {}).get("name") or CCR_TOOL_NAME),
+                    "response": retrieval_data,
+                }
+            }
+        else:
+            tool_result = {"tool_call_id": tool_call_id, "content": result_content}
+        response_payload = {
             "tool_result": tool_result,
             "success": "error" not in retrieval_data,
             "data": retrieval_data,
         }
+        from headroom.transforms.retrieval_aware_policy import (
+            compression_cost_tracking_enabled,
+            estimate_payload_tokens,
+            get_compression_cost_ledger,
+        )
+
+        if entry is not None:
+            # Returning a provider-shaped tool result to a client does not prove
+            # that the client injected it into a model request. Supply a stable
+            # report for an explicit post-injection acknowledgement instead.
+            accounting_report = {
+                "hash": hash_key,
+                "retrieval_event_id": stable_retrieval_event_id(
+                    "http_tool_call",
+                    provider,
+                    tool_call_id,
+                    hash_key,
+                    entry.compression_event_id,
+                ),
+                "recovery_payload_tokens": estimate_payload_tokens(tool_result),
+                "compression_event_id": entry.compression_event_id,
+                "retrieval_handle": entry.retrieval_handle,
+            }
+            response_payload["accounting"] = {
+                "status": "pending_model_injection",
+                "report_endpoint": "/v1/retrieve/account",
+                "report": accounting_report,
+            }
+
+        if compression_cost_tracking_enabled():
+            get_compression_cost_ledger().record_http_transport_retrieval(
+                estimate_payload_tokens(response_payload)
+            )
+        return response_payload
 
     # Compression-only endpoint (for TypeScript SDK and other HTTP clients).
     # Loopback-only by default (guard added in #1537). An operator can opt in to
@@ -5261,6 +5595,13 @@ def run_server(
     config = config or ProxyConfig()
     if workers < 1:
         raise ValueError("workers must be >= 1")
+    retrieval_aware_mode = os.environ.get("HEADROOM_RETRIEVAL_AWARE", "").strip().lower()
+    if workers > 1 and retrieval_aware_mode in _RETRIEVAL_AWARE_ENABLED_MODES:
+        raise ValueError(
+            "Retrieval-aware compression requires --workers 1 because its "
+            "compression ledger and retrieval-event idempotency horizon are "
+            "process-local. Use a single worker or disable HEADROOM_RETRIEVAL_AWARE."
+        )
     config.worker_processes = workers
     code_aware_status = _get_code_aware_banner_status(config)
 

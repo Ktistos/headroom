@@ -548,6 +548,9 @@ class GeminiHandlerMixin:
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         waste_messages=waste_messages,
+                        request_id=request_id,
+                        session_id=request_id,
+                        recovery_payload_path="google",
                         **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -570,6 +573,9 @@ class GeminiHandlerMixin:
                 f"[{request_id}] Optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
             )
+            from headroom.transforms.content_router import finalize_request_policy_side_effects
+
+            finalize_request_policy_side_effects(commit=False, renew=True)
             optimized_messages = messages
             optimized_tokens = original_tokens
             transforms_applied = []
@@ -1087,6 +1093,9 @@ class GeminiHandlerMixin:
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         waste_messages=waste_messages,
+                        request_id=request_id,
+                        session_id=request_id,
+                        recovery_payload_path="google",
                         **proxy_pipeline_kwargs(self.config),
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1104,6 +1113,9 @@ class GeminiHandlerMixin:
                 f"[{request_id}] Cloud Code Assist optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
             )
+            from headroom.transforms.content_router import finalize_request_policy_side_effects
+
+            finalize_request_policy_side_effects(commit=False, renew=True)
             optimized_messages = messages
             optimized_tokens = original_tokens
             transforms_applied = []
@@ -1341,14 +1353,23 @@ class GeminiHandlerMixin:
             )
         if _decision.should_compress:
             try:
+                from headroom.transforms.content_router import (
+                    run_with_discarded_policy_side_effects,
+                )
+
                 context_limit = self.openai_provider.get_context_limit(model)
                 result = await self._run_compression_in_executor(
-                    lambda: self.openai_pipeline.apply(
-                        messages=messages,
-                        model=model,
-                        model_limit=context_limit,
-                        context=extract_user_query(messages),
-                        **proxy_pipeline_kwargs(self.config),
+                    lambda: run_with_discarded_policy_side_effects(
+                        lambda: self.openai_pipeline.apply(
+                            messages=messages,
+                            model=model,
+                            model_limit=context_limit,
+                            context=extract_user_query(messages),
+                            request_id=request_id,
+                            session_id=request_id,
+                            recovery_payload_path="google",
+                            **proxy_pipeline_kwargs(self.config),
+                        )
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )

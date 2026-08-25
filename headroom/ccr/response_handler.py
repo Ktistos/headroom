@@ -13,6 +13,7 @@ can't handle the LLM's tool calls.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -29,6 +30,29 @@ from .tool_calls import (
 from .tool_injection import CCR_TOOL_NAME
 
 logger = logging.getLogger(__name__)
+
+
+def _retrieve_with_supported_reference(
+    store: Any,
+    hash_key: str,
+    handle: str,
+    *,
+    commit_model_recovery: bool = False,
+) -> Any:
+    """Read internally or commit feedback without breaking legacy stores."""
+    retrieve = (
+        store.retrieve
+        if commit_model_recovery
+        else getattr(store, "retrieve_for_internal_use", store.retrieve)
+    )
+    try:
+        supports_handle = "retrieval_handle" in inspect.signature(retrieve).parameters
+    except (TypeError, ValueError):
+        supports_handle = False
+    if supports_handle:
+        return retrieve(hash_key, retrieval_handle=handle or None)
+    return retrieve(hash_key)
+
 
 # Residual-CCR status signals (provider-generic).
 #
@@ -59,6 +83,9 @@ class CCRToolResult:
     success: bool
     items_retrieved: int = 0
     tool_name: str | None = None
+    hash_key: str = ""
+    retrieval_event_id: str = ""
+    compression_entry: Any = field(default=None, repr=False)
 
 
 @dataclass
@@ -180,7 +207,22 @@ class CCRResponseHandler:
         """
         return parse_ccr_tool_calls(response, provider)
 
-    def _execute_retrieval(self, ccr_call: CCRToolCall) -> CCRToolResult:
+    def _execute_retrieval_for_provider(
+        self, ccr_call: CCRToolCall, provider: str
+    ) -> CCRToolResult:
+        """Pass provider identity without breaking legacy test/extensions hooks."""
+        execute = self._execute_retrieval
+        try:
+            supports_provider = "provider" in inspect.signature(execute).parameters
+        except (TypeError, ValueError):
+            supports_provider = False
+        if supports_provider:
+            return execute(ccr_call, provider=provider)
+        return execute(ccr_call)
+
+    def _execute_retrieval(
+        self, ccr_call: CCRToolCall, *, provider: str = "automatic"
+    ) -> CCRToolResult:
         """Execute a CCR retrieval.
 
         Args:
@@ -215,8 +257,60 @@ class CCRResponseHandler:
                     tool_name=ccr_call.tool_name,
                 )
 
+            reference_status_fn = getattr(store, "get_retrieval_reference_status", None)
+            reference_status = (
+                reference_status_fn(
+                    ccr_call.hash_key,
+                    retrieval_handle=ccr_call.retrieval_handle or None,
+                )
+                if callable(reference_status_fn)
+                else None
+            )
+            if reference_status is not None and reference_status["status"] in {
+                "ambiguous",
+                "unresolved",
+            }:
+                from ..transforms.retrieval_aware_policy import (
+                    compression_cost_tracking_enabled,
+                    get_compression_cost_ledger,
+                    stable_retrieval_event_id,
+                )
+
+                retrieval_event_id = stable_retrieval_event_id(
+                    provider,
+                    ccr_call.tool_call_id,
+                    ccr_call.hash_key,
+                    ccr_call.retrieval_handle,
+                )
+                if compression_cost_tracking_enabled():
+                    get_compression_cost_ledger().record_rejected_retrieval_attempt(
+                        ccr_call.hash_key,
+                        retrieval_event_id=retrieval_event_id,
+                        ambiguous=reference_status["status"] == "ambiguous",
+                    )
+                content = json.dumps(
+                    {
+                        "error": "retrieval reference is ambiguous"
+                        if reference_status["status"] == "ambiguous"
+                        else "retrieval reference did not resolve",
+                        "hash": ccr_call.hash_key,
+                        "status": reference_status["status"],
+                    },
+                    indent=2,
+                )
+                return CCRToolResult(
+                    tool_call_id=ccr_call.tool_call_id,
+                    content=content,
+                    success=False,
+                    tool_name=ccr_call.tool_name,
+                    hash_key=ccr_call.hash_key,
+                    retrieval_event_id=retrieval_event_id,
+                )
+
             # Retrieval is by hash: always return the full original content.
-            entry = store.retrieve(ccr_call.hash_key)
+            entry = _retrieve_with_supported_reference(
+                store, ccr_call.hash_key, ccr_call.retrieval_handle
+            )
             if entry:
                 content = json.dumps(
                     {
@@ -226,12 +320,22 @@ class CCRResponseHandler:
                     },
                     indent=2,
                 )
+                from ..transforms.retrieval_aware_policy import stable_retrieval_event_id
+
                 return CCRToolResult(
                     tool_call_id=ccr_call.tool_call_id,
                     content=content,
                     success=True,
                     items_retrieved=entry.original_item_count,
                     tool_name=ccr_call.tool_name,
+                    hash_key=ccr_call.hash_key,
+                    retrieval_event_id=stable_retrieval_event_id(
+                        provider,
+                        ccr_call.tool_call_id,
+                        ccr_call.hash_key,
+                        getattr(entry, "compression_event_id", ""),
+                    ),
+                    compression_entry=entry,
                 )
 
             miss_status = (
@@ -271,73 +375,111 @@ class CCRResponseHandler:
                 tool_name=ccr_call.tool_name,
             )
 
+    @staticmethod
+    def _charge_model_payloads(
+        results: list[CCRToolResult],
+        item_payloads: list[Any],
+        *,
+        full_payload: Any | None = None,
+    ) -> None:
+        """Charge each recovered item and one shared provider envelope."""
+        try:
+            from ..transforms.retrieval_aware_policy import (
+                CompressionCostLedger,
+                account_recovery_payload_tokens,
+                compression_cost_tracking_enabled,
+                estimate_payload_tokens,
+                get_compression_cost_ledger,
+            )
+
+            tracking_enabled = compression_cost_tracking_enabled()
+            ledger = get_compression_cost_ledger()
+            item_costs = [estimate_payload_tokens(item) for item in item_payloads]
+            shared_cost = 0
+            if full_payload is not None:
+                shared_cost = max(
+                    estimate_payload_tokens(full_payload) - sum(item_costs),
+                    0,
+                )
+            shared_assigned = False
+            for result, item_cost in zip(results, item_costs, strict=True):
+                if not result.success or result.compression_entry is None:
+                    continue
+                cost = item_cost
+                if not shared_assigned:
+                    cost += shared_cost
+                    shared_assigned = True
+                retrieval_event_id = (
+                    result.retrieval_event_id or CompressionCostLedger.new_retrieval_event_id()
+                )
+                commit_feedback = True
+                if tracking_enabled:
+                    status = account_recovery_payload_tokens(
+                        result.compression_entry,
+                        cost,
+                        retrieval_event_id=retrieval_event_id,
+                    )
+                    commit_feedback = status.value in {"attributed", "unattributed"}
+                else:
+                    commit_feedback = ledger.claim_feedback_report(retrieval_event_id)
+                # Store/TOIN feedback is committed only after the continuation
+                # request accepted this provider payload. A retry with the same
+                # retrieval-event ID is not learned twice.
+                if commit_feedback:
+                    _retrieve_with_supported_reference(
+                        get_compression_store(),
+                        result.hash_key,
+                        str(getattr(result.compression_entry, "retrieval_handle", "") or ""),
+                        commit_model_recovery=True,
+                    )
+        except Exception:
+            logger.debug("CCR tool-result payload accounting failed", exc_info=True)
+
     def _create_tool_result_message(
         self,
         results: list[CCRToolResult],
         provider: str,
     ) -> dict[str, Any]:
-        """Create a tool result message from CCR results.
-
-        Args:
-            results: List of CCR tool results.
-            provider: The provider type.
-
-        Returns:
-            Message dict in the appropriate format.
-        """
+        """Create the exact provider payload for the next model request."""
         if provider == "anthropic":
-            # Anthropic: user message with tool_result content blocks
-            content_blocks = []
-            for result in results:
-                content_blocks.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": result.tool_call_id,
-                        "content": result.content,
-                    }
-                )
-            return {
-                "role": "user",
-                "content": content_blocks,
-            }
+            blocks = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": result.tool_call_id,
+                    "content": result.content,
+                }
+                for result in results
+            ]
+            payload = {"role": "user", "content": blocks}
+            return payload
 
-        elif provider == "openai":
-            # OpenAI: multiple tool messages
-            # Actually for OpenAI we return a list of messages
-            return {
-                "_openai_tool_results": [
-                    {
-                        "role": "tool",
-                        "tool_call_id": result.tool_call_id,
-                        "content": result.content,
-                    }
-                    for result in results
-                ]
-            }
+        if provider == "openai":
+            messages = [
+                {
+                    "role": "tool",
+                    "tool_call_id": result.tool_call_id,
+                    "content": result.content,
+                }
+                for result in results
+            ]
+            # Each list element is an independent provider message; the private
+            # sentinel below is not sent to the model.
+            return {"_openai_tool_results": messages}
 
-        elif provider == "openai_responses":
-            # Responses API: `function_call_output` items, echoed back into
-            # `input[]` alongside (not nested under) the preceding
-            # function_call items. Sentinel key mirrors the "openai"
-            # multi-message pattern above — handle_response() extends
-            # rather than appends when it sees this key.
-            return {
-                "_openai_responses_tool_results": [
-                    {
-                        "type": "function_call_output",
-                        "call_id": result.tool_call_id,
-                        "output": result.content,
-                    }
-                    for result in results
-                ]
-            }
+        if provider == "openai_responses":
+            items = [
+                {
+                    "type": "function_call_output",
+                    "call_id": result.tool_call_id,
+                    "output": result.content,
+                }
+                for result in results
+            ]
+            return {"_openai_responses_tool_results": items}
 
-        elif provider == "google":
-            # Google/Gemini: user message with functionResponse parts
-            # Format: {"role": "user", "parts": [{"functionResponse": {"name": "...", "response": {...}}}]}
+        if provider == "google":
             parts = []
             for result in results:
-                # Parse the content JSON to include as response object
                 try:
                     response_data = json.loads(result.content)
                 except json.JSONDecodeError:
@@ -349,19 +491,43 @@ class CCRResponseHandler:
                 if result.tool_name and result.tool_call_id != result.tool_name:
                     function_response["id"] = result.tool_call_id
                 parts.append({"functionResponse": function_response})
-            return {
-                "role": "user",
-                "parts": parts,
-            }
+            payload = {"role": "user", "parts": parts}
+            return payload
 
+        generic_items = [
+            {"tool_call_id": result.tool_call_id, "result": result.content} for result in results
+        ]
+        payload = {"role": "tool", "content": json.dumps(generic_items)}
+        return payload
+
+    def _account_created_tool_result(
+        self,
+        results: list[CCRToolResult],
+        provider: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Account only after the provider-shaped result entered the request."""
+        if provider == "anthropic":
+            blocks = list(payload.get("content") or [])
+            self._charge_model_payloads(results, blocks, full_payload=payload)
+        elif provider == "openai":
+            self._charge_model_payloads(results, list(payload.get("_openai_tool_results") or []))
+        elif provider == "openai_responses":
+            self._charge_model_payloads(
+                results, list(payload.get("_openai_responses_tool_results") or [])
+            )
+        elif provider == "google":
+            parts = list(payload.get("parts") or [])
+            self._charge_model_payloads(results, parts, full_payload=payload)
         else:
-            # Generic format
-            return {
-                "role": "tool",
-                "content": json.dumps(
-                    [{"tool_call_id": r.tool_call_id, "result": r.content} for r in results]
-                ),
-            }
+            # The generic payload serializes every result into one content
+            # string. Attribute each logical item and allocate the single outer
+            # provider envelope once across the recovered events.
+            generic_items = [
+                {"tool_call_id": result.tool_call_id, "result": result.content}
+                for result in results
+            ]
+            self._charge_model_payloads(results, generic_items, full_payload=payload)
 
     def _extract_assistant_message(
         self,
@@ -494,7 +660,7 @@ class CCRResponseHandler:
             logger.info(f"CCR: Handling {len(ccr_calls)} retrieval(s) in round {rounds}")
 
             # Execute all CCR retrievals
-            results = [self._execute_retrieval(call) for call in ccr_calls]
+            results = [self._execute_retrieval_for_provider(call, provider) for call in ccr_calls]
 
             # Log retrieval stats
             total_items = sum(r.items_retrieved for r in results)
@@ -527,9 +693,22 @@ class CCRResponseHandler:
             else:
                 current_messages.append(tool_result_msg)
 
-            # Make continuation API call
+            # Make continuation API call. Account only after the provider
+            # accepted the request; merely constructing or appending a local
+            # message does not prove that recovery entered a model turn.
             try:
-                current_response = await api_call_fn(current_messages, tools)
+                next_response = await api_call_fn(current_messages, tools)
+                # Gemini preserves an upstream continuation failure in a
+                # private sentinel so its outer handler can return the exact
+                # status/body.  That sentinel is not a successful model turn:
+                # do not charge recovery payload or teach retrieval feedback.
+                if isinstance(next_response, dict) and isinstance(
+                    next_response.get("_headroom_continuation_error"), dict
+                ):
+                    current_response = next_response
+                    break
+                self._account_created_tool_result(results, provider, tool_result_msg)
+                current_response = next_response
             except Exception as e:
                 logger.error(f"CCR: Continuation API call failed: {e}")
                 # Return the response we had (with unhandled CCR calls)

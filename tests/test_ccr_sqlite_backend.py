@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -74,6 +75,111 @@ class TestSQLiteBackend:
         writer.set("h1", make_entry())
         assert reader.get("h1") is not None
 
+    def test_stale_worker_write_merges_same_hash_attribution(self, db_path):
+        first = make_entry(content="same original")
+        first.compression_event_id = "event-a"
+        first.session_id = "session-a"
+        second = make_entry(content="same original")
+        second.compression_event_id = "event-b"
+        second.session_id = "session-b"
+
+        SQLiteBackend(db_path).set("h1", first)
+        SQLiteBackend(db_path).set("h1", second)
+
+        got = SQLiteBackend(db_path).get("h1")
+        assert got is not None
+        assert {item["compression_event_id"] for item in got.attribution_candidates} == {
+            "event-a",
+            "event-b",
+        }
+
+    def test_two_connections_persist_and_resolve_event_scoped_handles_atomically(self, db_path):
+        writer_a = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        writer_b = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        reader = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        hash_key = "aabbcc123456"
+        for index, writer in enumerate((writer_a, writer_b)):
+            writer.store(
+                original="same original",
+                compressed=f"<<ccr:{hash_key}@rh-{index:032x}>>",
+                explicit_hash=hash_key,
+                retrieval_handle=f"rh-{index:032x}",
+                compression_event_id=f"event-{index}",
+                session_id=f"session-{index}",
+                request_id=f"request-{index}",
+                tool_call_id=f"call-{index}",
+                provider_slot=f"slot-{index}",
+            )
+
+        for index in range(2):
+            resolved = reader.retrieve_for_internal_use(
+                hash_key, retrieval_handle=f"rh-{index:032x}"
+            )
+            assert resolved is not None
+            assert resolved.compression_event_id == f"event-{index}"
+            assert resolved.provider_slot == f"slot-{index}"
+            assert len(resolved.attribution_candidates) == 1
+
+        assert reader.retrieve_for_internal_use(hash_key) is None
+        assert reader.get_retrieval_reference_status(hash_key)["status"] == "ambiguous"
+
+    def test_stale_premerge_cannot_resurrect_discarded_candidate(self, db_path, monkeypatch):
+        writer_a = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        writer_b = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        reader = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        hash_key = "aabbcc777777"
+        writer_a.store(
+            original="same original",
+            compressed="first",
+            explicit_hash=hash_key,
+            retrieval_handle=f"rh-{0:032x}",
+            compression_event_id="event-0",
+        )
+
+        original_set = writer_b._backend.set
+
+        def set_after_discard(key, entry):
+            assert writer_a.discard_attribution_candidate(hash_key, compression_event_id="event-0")
+            original_set(key, entry)
+
+        monkeypatch.setattr(writer_b._backend, "set", set_after_discard)
+        writer_b.store(
+            original="same original",
+            compressed="second",
+            explicit_hash=hash_key,
+            retrieval_handle=f"rh-{1:032x}",
+            compression_event_id="event-1",
+        )
+
+        resolved = reader.retrieve_for_internal_use(hash_key)
+        assert resolved is not None
+        assert resolved.compression_event_id == "event-1"
+        assert resolved.retrieval_handle == f"rh-{1:032x}"
+        assert reader.get_retrieval_reference_status(hash_key)["candidate_count"] == 1
+
+    def test_never_emitted_candidate_is_removed_atomically_across_workers(self, db_path):
+        writer_a = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        writer_b = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        reader = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        hash_key = "aabbcc654321"
+        for index, writer in enumerate((writer_a, writer_b)):
+            writer.store(
+                original="same original",
+                compressed=f"<<ccr:{hash_key}@rh-{index:032x}>>",
+                explicit_hash=hash_key,
+                retrieval_handle=f"rh-{index:032x}",
+                compression_event_id=f"event-{index}",
+            )
+
+        assert writer_a.discard_attribution_candidate(hash_key, compression_event_id="event-0")
+        resolved = reader.retrieve_for_internal_use(hash_key)
+        assert resolved is not None
+        assert resolved.compression_event_id == "event-1"
+        assert resolved.retrieval_handle == f"rh-{1:032x}"
+
+        assert writer_b.discard_attribution_candidate(hash_key, compression_event_id="event-1")
+        assert reader.get_entry_status(hash_key)["status"] == "missing"
+
     def test_items_and_stats(self, db_path):
         b = SQLiteBackend(db_path)
         b.set("h1", make_entry("h1"))
@@ -127,6 +233,29 @@ class TestSQLiteBackend:
         got = reopened.get("h1")
         assert got is not None
         assert got.retrieval_count == 1
+
+    def test_same_hash_attribution_candidates_persist_and_disambiguate(self, db_path):
+        writer = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        for event_id, session_id in (("event-a", "session-a"), ("event-b", "session-b")):
+            writer.store(
+                original="same original",
+                compressed="short",
+                compression_event_id=event_id,
+                session_id=session_id,
+                request_id=f"request-{session_id}",
+                tool_call_id=f"call-{session_id}",
+            )
+
+        reader = CompressionStore(backend=SQLiteBackend(db_path), enable_feedback=False)
+        hash_key = writer.store("same original", "short")
+        assert reader.retrieve(hash_key) is None
+        assert reader.get_retrieval_reference_status(hash_key)["status"] == "ambiguous"
+
+        resolved = reader.retrieve(hash_key, session_id="session-a")
+        assert resolved is not None
+        assert resolved.compression_event_id == "event-a"
+        assert resolved.request_id == "request-session-a"
+        assert len(resolved.attribution_candidates) == 1
 
 
 class TestMultiWorkerSafety:
@@ -273,6 +402,136 @@ class TestDefaults:
 
         assert "re-read" in CCR_MISS_MESSAGE
         assert "re-run" in CCR_MISS_MESSAGE
+
+
+def test_identical_event_upsert_preserves_existing_feedback(db_path):
+    first_backend = SQLiteBackend(db_path)
+    second_backend = SQLiteBackend(db_path)
+    first = CompressionStore(backend=first_backend, enable_feedback=False)
+    second = CompressionStore(backend=second_backend, enable_feedback=False)
+    hash_key = "d" * 24
+    first_handle = "rh-" + "a" * 32
+    second_handle = "rh-" + "b" * 32
+
+    first.store(
+        "same original",
+        "first",
+        explicit_hash=hash_key,
+        compression_event_id="event-a",
+        retrieval_handle=first_handle,
+    )
+    assert first.retrieve(hash_key, retrieval_handle=first_handle, query="first query")
+    second.store(
+        "same original",
+        "second",
+        explicit_hash=hash_key,
+        compression_event_id="event-b",
+        retrieval_handle=second_handle,
+    )
+
+    entry = first_backend.get(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 1
+    assert entry.search_queries == ["first query"]
+    assert {item["compression_event_id"] for item in entry.attribution_candidates} == {
+        "event-a",
+        "event-b",
+    }
+
+
+def test_stale_set_cannot_resurrect_discarded_candidate(db_path):
+    first_backend = SQLiteBackend(db_path)
+    second_backend = SQLiteBackend(db_path)
+    first = CompressionStore(backend=first_backend, enable_feedback=False)
+    second = CompressionStore(backend=second_backend, enable_feedback=False)
+    hash_key = "e" * 24
+
+    first.store(
+        "same original",
+        "first",
+        explicit_hash=hash_key,
+        compression_event_id="event-a",
+        retrieval_handle="rh-" + "a" * 32,
+    )
+    second.store(
+        "same original",
+        "second",
+        explicit_hash=hash_key,
+        compression_event_id="event-b",
+        retrieval_handle="rh-" + "b" * 32,
+    )
+    stale = first_backend.get(hash_key)
+    assert stale is not None
+    assert second.discard_attribution_candidate(hash_key, compression_event_id="event-a")
+
+    stale.record_access("stale query")
+    first_backend.set(hash_key, stale)
+
+    current = second_backend.get(hash_key)
+    assert current is not None
+    assert [item["compression_event_id"] for item in current.attribution_candidates] == ["event-b"]
+
+
+def test_atomic_sqlite_retrievals_do_not_lose_concurrent_increments(db_path):
+    first_backend = SQLiteBackend(db_path)
+    second_backend = SQLiteBackend(db_path)
+    stores = [
+        CompressionStore(backend=first_backend, enable_feedback=False),
+        CompressionStore(backend=second_backend, enable_feedback=False),
+    ]
+    hash_key = "f" * 24
+    handle = "rh-" + "c" * 32
+    stores[0].store(
+        "shared original",
+        "compressed",
+        explicit_hash=hash_key,
+        compression_event_id="event-shared",
+        retrieval_handle=handle,
+    )
+
+    def retrieve(index: int) -> bool:
+        return stores[index % 2].retrieve(hash_key, retrieval_handle=handle) is not None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        assert all(executor.map(retrieve, range(40)))
+
+    entry = first_backend.get(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 40
+
+
+def test_single_candidate_stale_set_cannot_resurrect_discarded_event(db_path):
+    first_backend = SQLiteBackend(db_path)
+    second_backend = SQLiteBackend(db_path)
+    first = CompressionStore(backend=first_backend, enable_feedback=False)
+    second = CompressionStore(backend=second_backend, enable_feedback=False)
+    hash_key = "1" * 24
+
+    first.store(
+        "same original",
+        "first",
+        explicit_hash=hash_key,
+        compression_event_id="event-a",
+        retrieval_handle="rh-" + "a" * 32,
+    )
+    stale = first_backend.get(hash_key)
+    assert stale is not None
+    assert first.discard_attribution_candidate(hash_key, compression_event_id="event-a")
+    assert not second_backend.exists(hash_key)
+
+    second.store(
+        "same original",
+        "second",
+        explicit_hash=hash_key,
+        compression_event_id="event-b",
+        retrieval_handle="rh-" + "b" * 32,
+    )
+    first_backend.set(hash_key, stale)
+
+    current = second_backend.get(hash_key)
+    assert current is not None
+    assert [item["compression_event_id"] for item in current.attribution_candidates] == ["event-b"]
+    assert first_backend.get_stats()["discard_tombstone_count"] == 1
 
 
 if __name__ == "__main__":

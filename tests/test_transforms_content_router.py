@@ -1001,6 +1001,148 @@ def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) ->
     assert result["content"][0]["content"] == long_text
 
 
+def _mock_recoverable_nested_compression(
+    router: ContentRouter, monkeypatch: pytest.MonkeyPatch, calls: list[dict]
+) -> None:
+    def fake_compress(content, **kwargs):
+        calls.append({"content": content, **kwargs})
+        return SimpleNamespace(
+            compressed=content[:80] + "\n<<ccr:abcdef123456>>",
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+
+
+def test_nested_tool_result_text_blocks_preserve_boundaries_and_metadata(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    calls: list[dict] = []
+    _mock_recoverable_nested_compression(router, monkeypatch, calls)
+    original_blocks = [
+        {"type": "text", "text": "A" * 800, "vendor_meta": {"slot": 0}},
+        {"type": "text", "text": "B" * 800, "citations": ["source-b"]},
+    ]
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "tool_result", "tool_use_id": "call-nested", "content": original_blocks}
+        ],
+    }
+
+    result = router._process_content_blocks(message, message["content"], "", [], set(), set())
+
+    nested = result["content"][0]["content"]
+    assert len(calls) == 2
+    assert len(nested) == 2
+    assert nested[0]["vendor_meta"] == {"slot": 0}
+    assert nested[1]["citations"] == ["source-b"]
+    assert nested[0]["text"].endswith("<<ccr:abcdef123456>>")
+    assert nested[1]["text"].endswith("<<ccr:abcdef123456>>")
+
+
+def test_nested_tool_result_cache_control_protects_entire_provider_block(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    calls: list[dict] = []
+    _mock_recoverable_nested_compression(router, monkeypatch, calls)
+    nested = [
+        {
+            "type": "text",
+            "text": "cached" * 200,
+            "cache_control": {"type": "ephemeral"},
+        },
+        {"type": "text", "text": "sibling" * 200},
+    ]
+    message = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "call-cache", "content": nested}],
+    }
+
+    result = router._process_content_blocks(message, message["content"], "", [], set(), set())
+
+    assert result == message
+    assert calls == []
+
+
+def test_nested_tool_result_with_non_string_text_fails_open() -> None:
+    router = ContentRouter(ContentRouterConfig())
+    nested = [{"type": "text", "text": 1234}]
+    message = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "call-malformed", "content": nested}],
+    }
+
+    result = router._process_content_blocks(message, message["content"], "", [], set(), set())
+
+    assert result == message
+
+
+def test_retrieval_aware_nested_tool_blocks_have_independent_provider_slots(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    router._retrieval_aware_policy = object()
+    calls: list[dict] = []
+    _mock_recoverable_nested_compression(router, monkeypatch, calls)
+    repeated = "same-content" * 100
+    message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call-slots",
+                "content": [
+                    {"type": "text", "text": repeated},
+                    {"type": "text", "text": repeated},
+                ],
+            }
+        ],
+    }
+
+    router._process_content_blocks(
+        message,
+        message["content"],
+        "query",
+        [],
+        set(),
+        set(),
+        request_id="request-nested",
+        session_id="session-nested",
+        message_index=4,
+        tool_name_map={"call-slots": "catalog"},
+    )
+
+    assert len(calls) == 2
+    assert [call["tool_name"] for call in calls] == ["catalog", "catalog"]
+    assert [call["attribution"]["provider_slot"] for call in calls] == [
+        "message[4].content[0].tool_result.content[0].text",
+        "message[4].content[0].tool_result.content[1].text",
+    ]
+
+
+def test_legacy_nested_tool_block_cache_reuses_identical_text(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    calls: list[dict] = []
+    _mock_recoverable_nested_compression(router, monkeypatch, calls)
+    repeated = "same-content" * 100
+    message = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call-legacy",
+                "content": [
+                    {"type": "text", "text": repeated},
+                    {"type": "text", "text": repeated},
+                ],
+            }
+        ],
+    }
+
+    result = router._process_content_blocks(message, message["content"], "", [], set(), set())
+
+    assert len(calls) == 1
+    assert result["content"][0]["content"][0]["text"] == result["content"][0]["content"][1]["text"]
+
+
 def test_assistant_text_blocks_skipped_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1074,7 +1216,7 @@ def test_system_text_blocks_skipped_when_skip_system_true(
     assert result["content"][0]["text"] == long_text
 
 
-def test_tool_role_text_blocks_compressed_by_default(
+def test_tool_role_text_blocks_reject_unmarked_lossy_compression(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     router = _make_router_with_mock_compress(monkeypatch)
@@ -1088,8 +1230,177 @@ def test_tool_role_text_blocks_compressed_by_default(
         set(),
         set(),
     )
-    # tool role ≈ tool output — compress freely
-    assert "[compressed]" in result["content"][0]["text"]
+    # Tool ground truth must remain reversible; the fake text strategy emits
+    # no CCR marker, so list-form content stays byte-for-byte unchanged.
+    assert result["content"][0]["text"] == long_text
+
+
+def _run_tool_text_block(
+    router: ContentRouter,
+    message: dict,
+    *,
+    request_id: str,
+    session_id: str = "session-list",
+    tool_name_map: dict[str, str] | None = None,
+    message_index: int = -1,
+    recovery_payload_path: str = "mcp",
+) -> dict:
+    return router._process_content_blocks(
+        message,
+        message["content"],
+        "query",
+        [],
+        set(),
+        set(),
+        request_id=request_id,
+        session_id=session_id,
+        tool_name_map=tool_name_map or {},
+        message_index=message_index,
+        recovery_payload_path=recovery_payload_path,
+    )
+
+
+def test_retrieval_aware_tool_text_blocks_scope_cache_per_request(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    router._retrieval_aware_policy = object()
+    calls: list[dict] = []
+
+    def fake_compress(content, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            compressed=content[:100],
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    message = {
+        "role": "tool",
+        "tool_call_id": "call-repeat",
+        "content": [{"type": "text", "text": "x" * 1000}],
+    }
+    _run_tool_text_block(
+        router, message, request_id="request-one", tool_name_map={"call-repeat": "catalog"}
+    )
+    _run_tool_text_block(
+        router, message, request_id="request-two", tool_name_map={"call-repeat": "catalog"}
+    )
+    assert len(calls) == 2
+    assert [call["tool_name"] for call in calls] == ["catalog", "catalog"]
+    assert [call["attribution"]["request_id"] for call in calls] == [
+        "request-one",
+        "request-two",
+    ]
+    assert all(call["attribution"]["provider_slot"] == "content[0].text" for call in calls)
+    assert all(call["attribution"]["recovery_payload_path"] == "mcp" for call in calls)
+
+
+def test_retrieval_aware_tool_text_blocks_scope_cache_per_tool_call(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    router._retrieval_aware_policy = object()
+    calls: list[str] = []
+
+    def fake_compress(content, **kwargs):
+        calls.append(kwargs["attribution"]["tool_call_id"])
+        return SimpleNamespace(
+            compressed=content[:100],
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    for tool_call_id in ("call-one", "call-two"):
+        message = {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": [{"type": "text", "text": "same" * 300}],
+        }
+        _run_tool_text_block(router, message, request_id="one-request")
+    assert calls == ["call-one", "call-two"]
+
+
+def test_retrieval_aware_tool_text_blocks_scope_cache_per_provider_slot(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    router._retrieval_aware_policy = object()
+    calls: list[tuple[str, str]] = []
+
+    def fake_compress(content, **kwargs):
+        attribution = kwargs["attribution"]
+        calls.append((attribution["provider_slot"], attribution["recovery_payload_path"]))
+        return SimpleNamespace(
+            compressed=content[:100],
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    message = {
+        "role": "tool",
+        "content": [{"type": "text", "text": "same" * 300}],
+    }
+    _run_tool_text_block(
+        router,
+        message,
+        request_id="one-request",
+        message_index=3,
+        recovery_payload_path="openai_chat",
+    )
+    _run_tool_text_block(
+        router,
+        message,
+        request_id="one-request",
+        message_index=4,
+        recovery_payload_path="openai_chat",
+    )
+    assert calls == [
+        ("message[3].content[0].text", "openai_chat"),
+        ("message[4].content[0].text", "openai_chat"),
+    ]
+
+
+def test_legacy_tool_text_block_cache_still_hits_across_requests(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    calls = 0
+
+    def fake_compress(content, **kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            compressed=content[:100],
+            compression_ratio=0.1,
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    message = {
+        "role": "tool",
+        "tool_call_id": "call-repeat",
+        "content": [{"type": "text", "text": "legacy" * 200}],
+    }
+    _run_tool_text_block(router, message, request_id="request-one")
+    _run_tool_text_block(router, message, request_id="request-two")
+    assert calls == 1
+
+
+def test_tool_text_block_enforces_reversibility(monkeypatch) -> None:
+    router = ContentRouter(ContentRouterConfig())
+    original = "ground truth " * 100
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda content, **kwargs: SimpleNamespace(
+            compressed="lossy summary",
+            compression_ratio=0.01,
+            strategy_used=CompressionStrategy.TEXT,
+        ),
+    )
+    message = {
+        "role": "tool",
+        "tool_call_id": "call-ground-truth",
+        "content": [{"type": "text", "text": original}],
+    }
+    result = _run_tool_text_block(router, message, request_id="request-safe")
+    assert result == message
 
 
 def test_unknown_role_text_blocks_skipped_for_safety(
@@ -1785,3 +2096,42 @@ def test_detect_content_overrides_html_misroute_for_grep_and_logs(
         "</section></main></body></html>"
     )
     assert _detect_content(html).content_type is ContentType.HTML
+
+
+def test_string_form_legacy_function_result_enforces_reversibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = "exact legacy function output " * 100
+    router = ContentRouter(
+        ContentRouterConfig(
+            exclude_tools=set(),
+            protect_recent_code=0,
+            protect_analysis_context=False,
+        )
+    )
+    monkeypatch.setattr(
+        router,
+        "compress",
+        lambda *_args, **_kwargs: RouterCompressionResult(
+            compressed="lossy unmarked summary",
+            original=original,
+            strategy_used=CompressionStrategy.TEXT,
+            routing_log=[
+                RoutingDecision(
+                    content_type=ContentType.PLAIN_TEXT,
+                    strategy=CompressionStrategy.TEXT,
+                    original_tokens=1000,
+                    compressed_tokens=10,
+                )
+            ],
+        ),
+    )
+
+    result = router.apply(
+        [{"role": "function", "name": "legacy_catalog", "content": original}],
+        _ChurnTokenizer(),
+        min_tokens_to_compress=1,
+        frozen_message_count=0,
+    )
+
+    assert result.messages[0]["content"] == original

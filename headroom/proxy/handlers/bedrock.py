@@ -176,10 +176,18 @@ class BedrockHandlerMixin:
                         model_limit=context_limit,
                         context=extract_user_query(messages),
                         request_id=request_id,
+                        session_id=request_id,
+                        recovery_payload_path="anthropic",
                     ),
                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                 )
-                if result.messages != messages:
+                if result.tokens_after > result.tokens_before:
+                    from headroom.transforms.content_router import (
+                        finalize_request_policy_side_effects,
+                    )
+
+                    finalize_request_policy_side_effects(commit=False, renew=True)
+                elif result.messages != messages:
                     body["messages"] = result.messages
                     outbound = json.dumps(body).encode("utf-8")
                     original_tokens = result.tokens_before

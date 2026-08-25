@@ -958,3 +958,244 @@ class TestWorkspaceScoping:
         # read, not purging on write — workspace A could come back and use
         # them again within the age window).
         assert len(tracker.get_tracked_hashes()) == 5
+
+
+def test_proactive_expansion_charges_only_after_formatted_context_is_injected():
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        estimate_payload_tokens,
+        get_compression_cost_ledger,
+    )
+
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    hash_key = "ab12cd34ef56"
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=500,
+        initially_emitted_tokens=100,
+        ccr_hashes=[hash_key],
+    )
+    store = get_compression_store()
+    store.store(
+        original='[{"id":1,"exact":"payload"}]',
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+    )
+    tracker = ContextTracker()
+    recommendations = [
+        ExpansionRecommendation(
+            hash_key=hash_key,
+            reason="relevant to query",
+            relevance_score=0.9,
+        )
+    ]
+
+    expansions = tracker.execute_expansions(recommendations)
+    rendered = tracker.format_expansions_for_context(expansions)
+    assert ledger.snapshot()["recovery_payload_tokens"] == 0
+    entry = store.retrieve_for_internal_use(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 0
+
+    tracker.account_injected_expansions(
+        expansions, rendered, injection_event_id="request-proactive-1"
+    )
+    expected_tokens = estimate_payload_tokens(rendered)
+    assert ledger.snapshot()["recovery_payload_tokens"] == expected_tokens
+    entry = store.retrieve_for_internal_use(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 1
+
+    tracker.account_injected_expansions(
+        expansions, rendered, injection_event_id="request-proactive-1"
+    )
+    assert ledger.snapshot()["recovery_payload_tokens"] == expected_tokens
+    entry = store.retrieve_for_internal_use(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 1
+    enable_compression_cost_tracking(False)
+    ledger.clear()
+
+
+def test_proactive_expansion_accounting_waits_for_provider_adoption():
+    from headroom.transforms.content_router import (
+        PolicySideEffectTransaction,
+        activate_policy_side_effect_transaction,
+    )
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    hash_key = "feedface1234"
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=500,
+        initially_emitted_tokens=100,
+        ccr_hashes=[hash_key],
+    )
+    store = get_compression_store()
+    store.store(
+        original='[{"id":1,"exact":"payload"}]',
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+    )
+    tracker = ContextTracker()
+    recommendations = [
+        ExpansionRecommendation(
+            hash_key=hash_key,
+            reason="relevant to query",
+            relevance_score=0.9,
+        )
+    ]
+    expansions = tracker.execute_expansions(recommendations)
+    rendered = tracker.format_expansions_for_context(expansions)
+
+    discarded = PolicySideEffectTransaction()
+    with activate_policy_side_effect_transaction(discarded):
+        tracker.account_injected_expansions(
+            expansions,
+            rendered,
+            injection_event_id="discarded-provider-request",
+        )
+        assert ledger.snapshot()["recovery_payload_tokens"] == 0
+    discarded.discard()
+    assert ledger.snapshot()["recovery_payload_tokens"] == 0
+    assert store.retrieve_for_internal_use(hash_key).retrieval_count == 0
+
+    adopted = PolicySideEffectTransaction()
+    with activate_policy_side_effect_transaction(adopted):
+        tracker.account_injected_expansions(
+            expansions,
+            rendered,
+            injection_event_id="accepted-provider-request",
+        )
+        assert ledger.snapshot()["recovery_payload_tokens"] == 0
+    adopted.commit()
+    assert ledger.snapshot()["recovery_payload_tokens"] > 0
+    assert store.retrieve_for_internal_use(hash_key).retrieval_count == 1
+
+    enable_compression_cost_tracking(False)
+    ledger.clear()
+
+
+def test_rejected_proactive_accounting_does_not_commit_store_feedback():
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    hash_key = "badc0ffee123"
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=500,
+        initially_emitted_tokens=100,
+        ccr_hashes=[hash_key],
+    )
+    store = get_compression_store()
+    store.store(
+        original="proactive payload",
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+    )
+    tracker = ContextTracker()
+    expansions = tracker.execute_expansions(
+        [
+            ExpansionRecommendation(
+                hash_key=hash_key,
+                reason="relevant",
+                relevance_score=1.0,
+            )
+        ]
+    )
+    rendered = tracker.format_expansions_for_context(expansions)
+
+    # Simulate a bounded-ledger eviction while the durable store entry is
+    # still redeemable. Accounting must fail closed without teaching the
+    # separate store/TOIN feedback path.
+    assert ledger.discard_outcome(event_id)
+    tracker.account_injected_expansions(
+        expansions,
+        rendered,
+        injection_event_id="rejected-proactive-request",
+    )
+
+    entry = store.retrieve_for_internal_use(hash_key, compression_event_id=event_id)
+    assert entry is not None
+    assert entry.retrieval_count == 0
+    assert ledger.snapshot()["attribution"]["rejected_retrieval_reports"] == 1
+
+    enable_compression_cost_tracking(False)
+    ledger.clear()
+    reset_compression_store()
+
+
+def test_proactive_expansion_deduplicates_feedback_when_tracking_disabled():
+    from headroom.transforms.retrieval_aware_policy import (
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(False)
+    hash_key = "ccddeeff0011"
+    store = get_compression_store()
+    store.store(
+        original="legacy proactive payload",
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+    )
+    tracker = ContextTracker()
+    expansions = tracker.execute_expansions(
+        [
+            ExpansionRecommendation(
+                hash_key=hash_key,
+                reason="relevant",
+                relevance_score=1.0,
+            )
+        ]
+    )
+    rendered = tracker.format_expansions_for_context(expansions)
+
+    tracker.account_injected_expansions(
+        expansions,
+        rendered,
+        injection_event_id="legacy-proactive-request",
+    )
+    tracker.account_injected_expansions(
+        expansions,
+        rendered,
+        injection_event_id="legacy-proactive-request",
+    )
+
+    entry = store.retrieve_for_internal_use(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 1
+    ledger.clear()
+    reset_compression_store()

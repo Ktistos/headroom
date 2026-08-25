@@ -731,17 +731,18 @@ class StreamingMixin:
 
             input_data = block.get("input", {})
             hash_key = input_data.get("hash")
+            retrieval_handle = input_data.get("handle")
 
             if not hash_key:
                 continue
 
             logger.info(f"[{request_id}] CCR Feedback: Recording retrieval hash={hash_key[:8]}...")
 
-            # Call store.retrieve() for the side effect of triggering the
+            # Record the observed call for the side effect of triggering the
             # feedback chain: _log_retrieval -> process_pending_feedback
             # -> toin.record_retrieval(). We discard the returned content.
             try:
-                store.retrieve(hash_key)
+                store.observe_retrieval_call(hash_key, retrieval_handle=retrieval_handle)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback recording failed: {e}")
 
@@ -752,7 +753,7 @@ class StreamingMixin:
         ``choices[0].delta.tool_calls[*].function.arguments`` (chunked
         JSON string). We accumulate per-call-index and finalize on
         stream completion. The accumulator records each completed
-        ``headroom_retrieve`` invocation as a no-op store call for the
+        ``headroom_retrieve`` invocation as an observation for the
         TOIN feedback side effect (matches the Anthropic streaming
         feedback path).
         """
@@ -806,6 +807,7 @@ class StreamingMixin:
             if not isinstance(input_data, dict):
                 continue
             hash_key = input_data.get("hash")
+            retrieval_handle = input_data.get("handle")
             if not hash_key:
                 continue
 
@@ -814,7 +816,7 @@ class StreamingMixin:
                 f"hash={hash_key[:8]}..."
             )
             try:
-                store.retrieve(hash_key)
+                store.observe_retrieval_call(hash_key, retrieval_handle=retrieval_handle)
             except Exception as e:
                 logger.debug(f"[{request_id}] CCR Feedback (openai stream) failed: {e}")
 

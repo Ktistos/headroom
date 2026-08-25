@@ -11,7 +11,7 @@ from headroom.transforms.compression_units import CompressionUnit, RoutedCompres
 from headroom.transforms.content_router import CompressionStrategy, RouterCompressionResult
 
 
-def _entry(index: int, text: str) -> CompressionBatchEntry:
+def _entry(index: int, text: str, metadata: dict[str, str] | None = None) -> CompressionBatchEntry:
     unit = CompressionUnit(
         text=text,
         provider="openai",
@@ -21,6 +21,7 @@ def _entry(index: int, text: str) -> CompressionBatchEntry:
         cache_zone="live",
         mutable=True,
         min_bytes=512,
+        metadata=metadata or {},
     )
     return CompressionBatchEntry(
         entry_id=f"u{index}",
@@ -229,3 +230,72 @@ def test_batch_uses_utf8_bytes_for_cjk_small_units():
     assert batches[0].text_bytes == 1800
     assert all(result.modified for _, result in results)
     assert [result.compressed for _, result in results] == ["短"] * 4
+
+
+def test_adjacent_small_outputs_from_distinct_calls_are_not_combined():
+    entries = [
+        _entry(
+            0,
+            "x" * 300,
+            {"tool_name": "catalog_search", "tool_call_id": "call-a"},
+        ),
+        _entry(
+            1,
+            "y" * 300,
+            {"tool_name": "catalog_search", "tool_call_id": "call-b"},
+        ),
+    ]
+
+    batches, skipped = build_compression_batches(
+        entries,
+        min_batch_bytes=512,
+        preserve_tool_call_attribution=True,
+    )
+
+    assert batches == []
+    assert [entry.entry_id for entry in skipped] == ["u0", "u1"]
+
+
+def test_adjacent_small_outputs_with_opposing_tool_priors_are_not_combined():
+    entries = [
+        _entry(0, "x" * 300, {"tool_name": "catalog_search", "tool_context": "list"}),
+        _entry(1, "y" * 300, {"tool_name": "Read", "tool_context": "exact file"}),
+    ]
+
+    batches, skipped = build_compression_batches(entries, min_batch_bytes=512)
+
+    # Combining these would apply one tools retrieval prior to both outputs.
+    assert batches == []
+    assert [entry.entry_id for entry in skipped] == ["u0", "u1"]
+
+
+class _SideEffectThenRaisesRouter:
+    def __init__(self, state: dict[str, int]) -> None:
+        self.state = state
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        from headroom.transforms.content_router import current_policy_side_effect_transaction
+
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        transaction.register(
+            "partial-batch-effect",
+            commit=lambda: self.state.__setitem__("committed", self.state["committed"] + 1),
+            discard=lambda: self.state.__setitem__("discarded", self.state["discarded"] + 1),
+        )
+        raise RuntimeError("router failed after registering an effect")
+
+
+def test_swallowed_batch_router_error_discards_partial_side_effects():
+    entries = [_entry(index, "x" * 150) for index in range(4)]
+    batches, _ = build_compression_batches(entries, min_batch_bytes=512)
+    state = {"committed": 0, "discarded": 0}
+
+    results = compress_batch_with_router(
+        batches[0],
+        router=_SideEffectThenRaisesRouter(state),
+        tokenizer=_CharacterCounter(),
+    )
+
+    assert [result.reason for _slot, result in results] == ["batch_router_error"] * 4
+    assert state == {"committed": 0, "discarded": 1}

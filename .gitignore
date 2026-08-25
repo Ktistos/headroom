@@ -205,6 +205,7 @@ temp/
 .benchmarks/
 benchmark_results.json
 benchmark_results/
+evaluation/retrieval_aware_agent_v2_smoke/
 
 # DeepEval cache
 .deepeval/

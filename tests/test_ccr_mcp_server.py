@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +68,163 @@ def test_mcp_retrieves_proxy_stored_content(fresh_store) -> None:
 
     assert result.get("source") == "local"
     assert result["original_content"] == original
+
+
+def test_mcp_internal_retrieval_does_not_charge_model_recovery(fresh_store) -> None:
+    original = '{"exact": "payload"}'
+    hash_key = get_compression_store().store(
+        original,
+        '{"short":true}',
+        original_tokens=77,
+    )
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    calls: list[tuple[str, dict, int]] = []
+
+    async def account(
+        proxy_hash: str, payload: dict, entry, *, retrieval_event_id: str | None = None
+    ) -> None:
+        assert retrieval_event_id is None
+        calls.append((proxy_hash, payload, entry.original_tokens))
+
+    server._report_recovery_via_proxy = account
+
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["source"] == "local"
+    assert calls == []
+    assert get_compression_store().retrieve_for_internal_use(hash_key).retrieval_count == 0
+
+
+def test_mcp_recovery_charges_only_after_confirmed_response_delivery(fresh_store) -> None:
+    original = '{"exact": "payload"}'
+    hash_key = get_compression_store().store(
+        original,
+        '{"short":true}',
+        original_tokens=77,
+    )
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._delivery_hook_installed = True
+    server.server.request_context = SimpleNamespace(request_id="request-7")
+    calls: list[tuple[str, dict, int, str | None]] = []
+
+    async def account(
+        proxy_hash: str,
+        payload: dict,
+        entry,
+        *,
+        retrieval_event_id: str | None = None,
+    ) -> dict[str, object]:
+        calls.append((proxy_hash, payload, entry.original_tokens, retrieval_event_id))
+        return {"status": "attributed", "feedback_committed": False}
+
+    server._report_recovery_via_proxy = account
+
+    response = asyncio.run(server._handle_retrieve({"hash": hash_key}))
+    request_key = server._request_key("request-7")
+
+    assert calls == []
+    assert get_compression_store().retrieve_for_internal_use(hash_key).retrieval_count == 0
+    assert request_key in server._pending_mcp_recoveries
+
+    asyncio.run(server._commit_pending_mcp_recovery(request_key))
+
+    visible_result = json.loads(response[0].kwargs["text"])
+    assert calls == [
+        (
+            hash_key,
+            mcp_server._retrieval_tool_payload(visible_result),
+            77,
+            server._current_retrieval_event_id(hash_key, ""),
+        )
+    ]
+    assert get_compression_store().retrieve_for_internal_use(hash_key).retrieval_count == 1
+
+    # A duplicate transport completion cannot charge or teach twice.
+    asyncio.run(server._commit_pending_mcp_recovery(request_key))
+    assert len(calls) == 1
+    assert get_compression_store().retrieve_for_internal_use(hash_key).retrieval_count == 1
+
+
+def test_mcp_rejected_accounting_report_does_not_commit_local_feedback(fresh_store) -> None:
+    hash_key = get_compression_store().store("payload", "short", original_tokens=20)
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    server._delivery_hook_installed = True
+    server.server.request_context = SimpleNamespace(request_id="request-rejected")
+
+    async def reject(*_args, **_kwargs) -> dict[str, object]:
+        return {"status": "rejected", "feedback_committed": False}
+
+    server._report_recovery_via_proxy = reject
+    asyncio.run(server._handle_retrieve({"hash": hash_key}))
+    asyncio.run(server._commit_pending_mcp_recovery(server._request_key("request-rejected")))
+
+    entry = get_compression_store().retrieve_for_internal_use(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 0
+
+
+def test_mcp_delivery_hook_commits_only_after_successful_send(monkeypatch) -> None:
+    class DeliveryServer:
+        def __init__(self, _name: str) -> None:
+            self.request_context = SimpleNamespace(request_id=None)
+
+        def list_tools(self):
+            return lambda function: function
+
+        def call_tool(self):
+            return lambda function: function
+
+        async def _handle_request(
+            self,
+            message,
+            _request,
+            _session,
+            _lifespan_context,
+            _raise_exceptions,
+        ) -> None:
+            await message.respond({"ok": True})
+
+    monkeypatch.setattr(mcp_server, "Server", DeliveryServer)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    commits: list[str] = []
+
+    async def commit(request_key: str) -> None:
+        commits.append(request_key)
+
+    server._commit_pending_mcp_recovery = commit
+
+    sent: list[dict[str, bool]] = []
+
+    async def successful_send(response: dict[str, bool]) -> None:
+        sent.append(response)
+
+    message = SimpleNamespace(request_id=7, respond=successful_send)
+    asyncio.run(server.server._handle_request(message, None, None, None, False))
+
+    assert sent == [{"ok": True}]
+    assert commits == [server._request_key(7)]
+
+    async def failed_send(_response: dict[str, bool]) -> None:
+        raise RuntimeError("transport closed")
+
+    message = SimpleNamespace(request_id=8, respond=failed_send)
+    with pytest.raises(RuntimeError, match="transport closed"):
+        asyncio.run(server.server._handle_request(message, None, None, None, False))
+    assert commits == [server._request_key(7)]
+
+
+def test_mcp_recovery_accounting_includes_serialized_tool_envelope() -> None:
+    from headroom.transforms.retrieval_aware_policy import estimate_payload_tokens
+
+    result = {
+        "hash": "abcdef123456",
+        "source": "local",
+        "original_content": '{"id": 1, "status": "ready"}',
+    }
+    payload = mcp_server._retrieval_tool_payload(result)
+
+    assert json.loads(payload["content"][0]["text"]) == result
+    assert estimate_payload_tokens(payload) > estimate_payload_tokens(result)
 
 
 def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
@@ -192,6 +350,19 @@ def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
     assert result["original_content"] == original
 
 
+def test_mcp_retrieve_log_omits_original_content(fresh_store, caplog) -> None:
+    original = "credential-shaped-but-synthetic-value-must-not-be-logged"
+    hash_key = get_compression_store().store(original, "<<small>>")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    with caplog.at_level("INFO", logger="headroom.ccr.mcp"):
+        response = asyncio.run(server._handle_retrieve({"hash": hash_key}))
+
+    assert original in response[0].kwargs["text"]
+    assert original not in caplog.text
+    assert "event=mcp_retrieve_completed" in caplog.text
+
+
 def test_mcp_retrieve_expired_hash_returns_terminal_guidance(
     monkeypatch,
     fresh_store,
@@ -268,7 +439,12 @@ def test_mcp_retrieve_missing_local_hash_can_still_hit_proxy(
     monkeypatch.setattr(mcp_server, "HTTPX_AVAILABLE", True)
     server = mcp_server.HeadroomMCPServer(check_proxy=True)
 
-    async def retrieve_via_proxy(hash_key: str) -> dict[str, object]:
+    async def retrieve_via_proxy(
+        hash_key: str,
+        retrieval_handle: str | None = None,
+        *,
+        retrieval_event_id: str | None = None,
+    ) -> dict[str, object]:
         return {"hash": hash_key, "original_content": "from proxy"}
 
     server._retrieve_via_proxy = retrieve_via_proxy
@@ -299,7 +475,12 @@ def test_mcp_retrieve_expired_local_hash_can_still_hit_proxy(
 
     server = mcp_server.HeadroomMCPServer(check_proxy=True)
 
-    async def retrieve_via_proxy(proxy_hash_key: str) -> dict[str, object]:
+    async def retrieve_via_proxy(
+        proxy_hash_key: str,
+        retrieval_handle: str | None = None,
+        *,
+        retrieval_event_id: str | None = None,
+    ) -> dict[str, object]:
         return {"hash": proxy_hash_key, "original_content": "from proxy"}
 
     server._retrieve_via_proxy = retrieve_via_proxy
@@ -492,3 +673,93 @@ def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
 
     assert excinfo.value.args[0] == 0
     assert cleaned["done"] is True
+
+
+def test_mcp_request_id_makes_cross_process_accounting_retry_stable() -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    server.server.request_context = SimpleNamespace(request_id="jsonrpc-42")
+
+    first = server._current_retrieval_event_id("abcdef123456", "rh-" + "a" * 32)
+    second = server._current_retrieval_event_id("abcdef123456", "rh-" + "a" * 32)
+    other = server._current_retrieval_event_id("abcdef123456", "rh-" + "b" * 32)
+
+    assert first == second
+    assert first != other
+    assert first.startswith("re-")
+
+
+def test_numeric_zero_mcp_request_id_is_retry_stable() -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    server.server.request_context = SimpleNamespace(request_id=0)
+
+    first = server._current_retrieval_event_id("abcdef123456", "rh-" + "a" * 32)
+    second = server._current_retrieval_event_id("abcdef123456", "rh-" + "a" * 32)
+
+    assert first == second
+    assert first.startswith("re-")
+
+
+def test_numeric_and_string_mcp_request_ids_have_distinct_idempotency_keys() -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    handle = "rh-" + "a" * 32
+    server.server.request_context = SimpleNamespace(request_id=7)
+    numeric = server._current_retrieval_event_id("abcdef123456", handle)
+    server.server.request_context = SimpleNamespace(request_id="7")
+    textual = server._current_retrieval_event_id("abcdef123456", handle)
+
+    assert numeric != textual
+
+
+def test_mcp_request_ids_are_scoped_to_transport_session() -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    first_session = object()
+    second_session = object()
+
+    assert server._request_key(1, first_session) != server._request_key(1, second_session)
+
+    server.server.request_context = SimpleNamespace(request_id=1, session=first_session)
+    first = server._current_request_key()
+    server.server.request_context = SimpleNamespace(request_id=1, session=second_session)
+    second = server._current_request_key()
+
+    assert first != second
+
+
+def test_mcp_ambiguous_legacy_hash_fails_closed_and_reports_rejection(fresh_store) -> None:
+    store = get_compression_store()
+    hash_key = "abcdef123456"
+    for index in range(2):
+        store.store(
+            original="same original",
+            compressed=f"<<ccr:{hash_key}>>",
+            explicit_hash=hash_key,
+            compression_event_id=f"event-{index}",
+            retrieval_handle=f"rh-{index:032x}",
+        )
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+    reports: list[tuple[str, str | None, str]] = []
+
+    async def report(
+        reported_hash: str,
+        *,
+        retrieval_event_id: str | None,
+        reason: str,
+    ) -> None:
+        reports.append((reported_hash, retrieval_event_id, reason))
+
+    server._report_rejection_via_proxy = report
+    result = asyncio.run(
+        server._retrieve_content(
+            hash_key,
+            retrieval_event_id="re-stable-ambiguous",
+        )
+    )
+
+    assert result == {
+        "error": "retrieval reference ambiguous",
+        "hash": hash_key,
+        "status": "ambiguous",
+    }
+    assert "original_content" not in result
+    assert reports == [(hash_key, "re-stable-ambiguous", "ambiguous")]

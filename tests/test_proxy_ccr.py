@@ -15,6 +15,46 @@ from fastapi.testclient import TestClient
 
 from headroom.cache.compression_store import get_compression_store, reset_compression_store
 from headroom.proxy.server import ProxyConfig, create_app
+from headroom.transforms.retrieval_aware_policy import compression_cost_tracking_enabled
+
+
+def _anthropic_retrieve_call(hash_key: str, call_id: str = "toolu_test") -> dict:
+    return {
+        "provider": "anthropic",
+        "tool_call": {
+            "id": call_id,
+            "name": "headroom_retrieve",
+            "input": {"hash": hash_key},
+        },
+    }
+
+
+def _acknowledge_model_injection(client: TestClient, tool_call_response):
+    payload = tool_call_response.json()
+    accounting = payload["accounting"]
+    assert accounting["status"] == "pending_model_injection"
+    response = client.post(
+        accounting["report_endpoint"],
+        json=accounting["report"],
+    )
+    assert response.status_code == 200
+    return response
+
+
+def test_proxy_construction_owns_retrieval_tracking_lifecycle(monkeypatch) -> None:
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+    )
+    monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "on")
+    create_app(config)
+    assert compression_cost_tracking_enabled()
+
+    monkeypatch.delenv("HEADROOM_RETRIEVAL_AWARE")
+    create_app(config)
+    assert not compression_cost_tracking_enabled()
 
 
 @pytest.fixture
@@ -109,22 +149,51 @@ class TestCCRRetrieveEndpoint:
         assert len(retrieved_items) == 50
         assert retrieved_items[0]["id"] == 0
 
-    def test_retrieve_increments_count(self, client):
-        """Each retrieval increments the retrieval count."""
+    def test_retrieve_same_hash_requires_origin_metadata_for_attribution(self, client):
+        store = get_compression_store()
+        for event_id, session_id in (("event-a", "session-a"), ("event-b", "session-b")):
+            hash_key = store.store(
+                original="same original",
+                compressed="short",
+                compression_event_id=event_id,
+                session_id=session_id,
+                request_id=f"request-{session_id}",
+                tool_call_id=f"call-{session_id}",
+            )
+
+        ambiguous = client.post(
+            "/v1/retrieve",
+            json={"hash": hash_key, "account_recovery": False},
+        )
+        assert ambiguous.status_code == 409
+        assert ambiguous.json()["detail"] == "retrieval reference ambiguous"
+
+        resolved = client.post(
+            "/v1/retrieve",
+            json={
+                "hash": hash_key,
+                "session_id": "session-a",
+                "account_recovery": False,
+            },
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["compression_event_id"] == "event-a"
+        assert "request_id" not in resolved.json()
+        assert "session_id" not in resolved.json()
+        assert "tool_call_id" not in resolved.json()
+
+    def test_raw_retrieve_does_not_increment_model_retrieval_count(self, client):
+        """Client-only transport is not model recovery or retrieval feedback."""
         store = get_compression_store()
         hash_key = store.store(original="[]", compressed="[]")
 
-        # First retrieval
         response1 = client.post("/v1/retrieve", json={"hash": hash_key})
-        assert response1.status_code == 200
-        count1 = response1.json()["retrieval_count"]
-
-        # Second retrieval
         response2 = client.post("/v1/retrieve", json={"hash": hash_key})
-        assert response2.status_code == 200
-        count2 = response2.json()["retrieval_count"]
 
-        assert count2 > count1
+        assert response1.status_code == 200
+        assert response2.status_code == 200
+        assert response1.json()["retrieval_count"] == 0
+        assert response2.json()["retrieval_count"] == 0
 
 
 class TestCCRRetrieveGetEndpoint:
@@ -213,9 +282,14 @@ class TestCCRStatsEndpoint:
             tool_name="stats_test_tool",
         )
 
-        # Make some retrievals (retrieval is by hash → always full)
-        client.post("/v1/retrieve", json={"hash": hash_key})
-        client.post("/v1/retrieve", json={"hash": hash_key})
+        # Provider tool results feed store stats only after the framework
+        # acknowledges that each result entered a model request.
+        for call_id in ("toolu_stats_1", "toolu_stats_2"):
+            tool_response = client.post(
+                "/v1/retrieve/tool_call",
+                json=_anthropic_retrieve_call(hash_key, call_id),
+            )
+            _acknowledge_model_injection(client, tool_response)
 
         response = client.get("/v1/retrieve/stats")
         assert response.status_code == 200
@@ -520,9 +594,14 @@ class TestEndToEndTOINIntegration:
                 strategy="smart_sample",
             )
 
-        # Retrieve through proxy endpoint
-        response = client_with_optimization.post("/v1/retrieve", json={"hash": hash_key})
+        # Retrieve the provider-shaped result, then acknowledge its insertion
+        # into the next model request.
+        response = client_with_optimization.post(
+            "/v1/retrieve/tool_call",
+            json=_anthropic_retrieve_call(hash_key, "toolu_toin_semantics"),
+        )
         assert response.status_code == 200
+        _acknowledge_model_injection(client_with_optimization, response)
 
         # Process pending feedback (this is what triggers TOIN learning)
         # Note: get_compression_store is already imported at module level
@@ -596,12 +675,13 @@ class TestEndToEndTOINIntegration:
                 strategy="smart_sample",
             )
 
-        # Step 2: Retrieve through proxy endpoint (by hash → full content)
+        # Step 2: retrieve the provider result and acknowledge model injection.
         response = client_with_optimization.post(
-            "/v1/retrieve",
-            json={"hash": hash_key},
+            "/v1/retrieve/tool_call",
+            json=_anthropic_retrieve_call(hash_key, "toolu_full_feedback"),
         )
         assert response.status_code == 200
+        _acknowledge_model_injection(client_with_optimization, response)
 
         # Process feedback (this triggers TOIN learning)
         store.process_pending_feedback()
@@ -631,3 +711,454 @@ class TestEndToEndTOINIntegration:
         # `RecommendationStore`. Assert the deprecation contract here so a
         # future revival of the API doesn't slip past silently.
         assert fresh_toin.get_recommendation(signature, "find category") is None
+
+
+def _seed_retrieval_accounting(hash_key: str = "abc123def456"):
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=1000,
+        initially_emitted_tokens=300,
+        ccr_hashes=[hash_key],
+        session_id="session-wire",
+        request_id="request-wire",
+        tool_call_id="call-wire",
+    )
+    store = get_compression_store()
+    store.store(
+        original='{"exact":"wire payload"}',
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+        session_id="session-wire",
+        request_id="request-wire",
+        tool_call_id="call-wire",
+        tool_name="catalog_reader",
+    )
+    return ledger
+
+
+class TestRetrievalAwareWireAccounting:
+    @pytest.fixture(autouse=True)
+    def _cleanup_ledger(self):
+        from headroom.transforms.retrieval_aware_policy import (
+            enable_compression_cost_tracking,
+            get_compression_cost_ledger,
+        )
+
+        yield
+        get_compression_cost_ledger().clear()
+        enable_compression_cost_tracking(False)
+
+    @pytest.mark.parametrize("method", ["post", "get"])
+    def test_raw_retrieve_is_transport_only(self, client, method):
+        from headroom.transforms.retrieval_aware_policy import estimate_payload_tokens
+
+        ledger = _seed_retrieval_accounting()
+        response = (
+            client.post("/v1/retrieve", json={"hash": "abc123def456"})
+            if method == "post"
+            else client.get("/v1/retrieve/abc123def456")
+        )
+        assert response.status_code == 200
+        snapshot = ledger.snapshot()
+        assert snapshot["actual_recovery_events"] == 0
+        assert snapshot["recovery_payload_tokens"] == 0
+        assert snapshot["non_model_retrievals"]["http_transport_retrieval_events"] == 1
+        assert snapshot["non_model_retrievals"]["http_transport_payload_tokens"] == (
+            estimate_payload_tokens(response.json())
+        )
+
+    def test_tool_call_charges_only_after_model_injection_acknowledgement(self, client):
+        from headroom.transforms.retrieval_aware_policy import estimate_payload_tokens
+
+        ledger = _seed_retrieval_accounting()
+        response = client.post(
+            "/v1/retrieve/tool_call",
+            json={
+                "provider": "anthropic",
+                "tool_call": {
+                    "id": "toolu_wire",
+                    "name": "headroom_retrieve",
+                    "input": {"hash": "abc123def456"},
+                },
+            },
+        )
+        assert response.status_code == 200
+        pending = ledger.snapshot()
+        assert pending["actual_recovery_events"] == 0
+        assert pending["recovery_payload_tokens"] == 0
+        assert pending["non_model_retrievals"]["http_transport_retrieval_events"] == 1
+        assert response.json()["accounting"]["report"]["recovery_payload_tokens"] == (
+            estimate_payload_tokens(response.json()["tool_result"])
+        )
+
+        report = response.json()["accounting"]["report"]
+        assert set(report) == {
+            "hash",
+            "retrieval_event_id",
+            "recovery_payload_tokens",
+            "compression_event_id",
+            "retrieval_handle",
+        }
+        assert (
+            get_compression_store().retrieve_for_internal_use("abc123def456").retrieval_count == 0
+        )
+        acknowledgement = _acknowledge_model_injection(client, response)
+
+        assert acknowledgement.json()["status"] == "attributed"
+        assert ledger.snapshot()["recovery_payload_tokens"] == estimate_payload_tokens(
+            response.json()["tool_result"]
+        )
+        assert (
+            get_compression_store().retrieve_for_internal_use("abc123def456").retrieval_count == 1
+        )
+
+    def test_two_identical_event_handles_retrieve_and_charge_independently(self, client):
+        from headroom.ccr.retrieval_reference import attach_retrieval_handle, references_in_text
+        from headroom.transforms.retrieval_aware_policy import (
+            CompressionAction,
+            enable_compression_cost_tracking,
+            get_compression_cost_ledger,
+        )
+
+        enable_compression_cost_tracking(True)
+        hash_key = "fedcba987654"
+        original = '{"same":"payload"}'
+        ledger = get_compression_cost_ledger()
+        ledger.clear()
+        store = get_compression_store()
+        records = []
+        for index in range(2):
+            event_id = ledger.record_outcome(
+                tool_name="catalog_reader",
+                strategy="row_drop",
+                action=CompressionAction.LOSSY,
+                predicted_action=CompressionAction.LOSSY,
+                original_tokens=1000,
+                initially_emitted_tokens=300,
+                ccr_hashes=[hash_key],
+                session_id=f"session-{index}",
+                request_id=f"request-{index}",
+                tool_call_id=f"call-{index}",
+                provider_slot=f"slot-{index}",
+            )
+            handle = ledger.new_retrieval_handle()
+            marker = attach_retrieval_handle(f"<<ccr:{hash_key}>>", handle)
+            reference = references_in_text(marker)[0]
+            assert reference.hash_key == hash_key
+            assert reference.retrieval_handle == handle
+            store.store(
+                original=original,
+                compressed=marker,
+                explicit_hash=hash_key,
+                retrieval_handle=handle,
+                compression_event_id=event_id,
+                session_id=f"session-{index}",
+                request_id=f"request-{index}",
+                tool_call_id=f"call-{index}",
+                provider_slot=f"slot-{index}",
+                tool_name="catalog_reader",
+            )
+            records.append((event_id, handle))
+
+        for index, (_event_id, handle) in enumerate(records):
+            response = client.post(
+                "/v1/retrieve/tool_call",
+                json={
+                    "provider": "openai",
+                    "tool_call": {
+                        "id": f"recovery-{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "headroom_retrieve",
+                            "arguments": json.dumps({"hash": hash_key, "handle": handle}),
+                        },
+                    },
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["success"] is True
+            assert ledger.snapshot()["actual_recovery_events"] == index
+            _acknowledge_model_injection(client, response)
+
+        recent = {row["compression_event_id"]: row for row in ledger.snapshot()["recent"]}
+        assert recent[records[0][0]]["retrieval_count"] == 1
+        assert recent[records[1][0]]["retrieval_count"] == 1
+        assert recent[records[0][0]]["recovery_payload_tokens"] > 0
+        assert recent[records[1][0]]["recovery_payload_tokens"] > 0
+
+        ambiguous = client.post(
+            "/v1/retrieve/tool_call",
+            json={
+                "provider": "openai",
+                "tool_call": {
+                    "id": "legacy-ambiguous",
+                    "type": "function",
+                    "function": {
+                        "name": "headroom_retrieve",
+                        "arguments": json.dumps({"hash": hash_key}),
+                    },
+                },
+            },
+        )
+        assert ambiguous.status_code == 200
+        assert ambiguous.json()["success"] is False
+        assert ambiguous.json()["data"]["status"] == "ambiguous"
+        assert "original_content" not in ambiguous.json()["data"]
+        after = ledger.snapshot()
+        assert after["actual_recovery_events"] == 2
+        assert after["attribution"]["ambiguous_attributions"] == 1
+        assert after["attribution"]["rejected_retrieval_reports"] == 1
+
+    def test_cross_process_report_is_idempotent(self, client):
+        ledger = _seed_retrieval_accounting()
+        report = {
+            "hash": "abc123def456",
+            "retrieval_event_id": "retrieval-stable-wire-id",
+            "recovery_payload_tokens": 321,
+            "compression_event_id": ledger.snapshot()["recent"][0]["compression_event_id"],
+            "session_id": "session-wire",
+            "request_id": "request-wire",
+            "tool_call_id": "call-wire",
+        }
+        first = client.post("/v1/retrieve/account", json=report)
+        second = client.post("/v1/retrieve/account", json=report)
+        assert first.json()["status"] == "attributed"
+        assert first.json()["feedback_committed"] is True
+        assert second.json()["status"] == "duplicate"
+        assert second.json()["feedback_committed"] is False
+        assert ledger.snapshot()["recovery_payload_tokens"] == 321
+        entry = get_compression_store().retrieve_for_internal_use("abc123def456")
+        assert entry is not None
+        assert entry.retrieval_count == 1
+
+    def test_rejected_accounting_report_does_not_teach_store_feedback(self, client, monkeypatch):
+        from headroom.transforms.retrieval_aware_policy import RetrievalReportStatus
+
+        ledger = _seed_retrieval_accounting()
+        monkeypatch.setattr(
+            ledger,
+            "record_recovery",
+            lambda *args, **kwargs: RetrievalReportStatus.REJECTED,
+        )
+        response = client.post(
+            "/v1/retrieve/account",
+            json={
+                "hash": "abc123def456",
+                "retrieval_event_id": "retrieval-rejected-wire-id",
+                "recovery_payload_tokens": 7,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "rejected"
+        assert response.json()["feedback_committed"] is False
+        entry = get_compression_store().retrieve_for_internal_use("abc123def456")
+        assert entry is not None
+        assert entry.retrieval_count == 0
+
+    def test_accounting_unset_secret_trusts_loopback_process(self, client, monkeypatch):
+        ledger = _seed_retrieval_accounting()
+        monkeypatch.delenv("HEADROOM_RETRIEVAL_ACCOUNT_SECRET", raising=False)
+        report = {
+            "hash": "abc123def456",
+            "retrieval_event_id": "retrieval-unset-secret-wire-id",
+            "recovery_payload_tokens": 7,
+            "compression_event_id": ledger.snapshot()["recent"][0]["compression_event_id"],
+        }
+        response = client.post("/v1/retrieve/account", json=report)
+        assert response.status_code == 200
+        assert response.json()["status"] == "attributed"
+
+    def test_disabled_accounting_acknowledgement_is_idempotent(self, client):
+        from headroom.transforms.retrieval_aware_policy import enable_compression_cost_tracking
+
+        ledger = _seed_retrieval_accounting()
+        enable_compression_cost_tracking(False)
+        report = {
+            "hash": "abc123def456",
+            "retrieval_event_id": "retrieval-disabled-feedback-id",
+            "recovery_payload_tokens": 7,
+            "compression_event_id": ledger.snapshot()["recent"][0]["compression_event_id"],
+        }
+
+        first = client.post("/v1/retrieve/account", json=report)
+        second = client.post("/v1/retrieve/account", json=report)
+
+        assert first.json()["status"] == "disabled"
+        assert first.json()["feedback_committed"] is True
+        assert second.json()["status"] == "duplicate"
+        assert second.json()["feedback_committed"] is False
+        entry = get_compression_store().retrieve_for_internal_use("abc123def456")
+        assert entry is not None
+        assert entry.retrieval_count == 1
+
+    def test_accounting_secret_fails_closed_and_forwarded_headers_do_not_help(
+        self, client, monkeypatch
+    ):
+        ledger = _seed_retrieval_accounting()
+        monkeypatch.setenv("HEADROOM_RETRIEVAL_ACCOUNT_SECRET", "local-secret")
+        report = {
+            "hash": "abc123def456",
+            "retrieval_event_id": "retrieval-secret-wire-id",
+            "recovery_payload_tokens": 7,
+            "compression_event_id": ledger.snapshot()["recent"][0]["compression_event_id"],
+        }
+        missing = client.post(
+            "/v1/retrieve/account",
+            json=report,
+            headers={"X-Forwarded-For": "127.0.0.1"},
+        )
+        incorrect = client.post(
+            "/v1/retrieve/account",
+            json=report,
+            headers={
+                "x-headroom-retrieval-account-secret": "wrong",
+                "X-Forwarded-For": "127.0.0.1",
+            },
+        )
+        allowed = client.post(
+            "/v1/retrieve/account",
+            json=report,
+            headers={"x-headroom-retrieval-account-secret": "local-secret"},
+        )
+        assert missing.status_code == 404
+        assert incorrect.status_code == 404
+        assert allowed.json()["status"] == "attributed"
+
+    def test_stats_preserves_store_and_recent_schema_with_nested_ledger(self, client):
+        _seed_retrieval_accounting()
+        response = client.get("/v1/retrieve/stats")
+        assert response.status_code == 200
+        payload = response.json()
+        assert "store" in payload
+        assert "recent_retrievals" in payload
+        assert payload["retrieval_aware"]["enabled"] is True
+        assert "ledger" in payload["retrieval_aware"]
+        assert payload["realized_cost"]["deprecated"] is True
+        assert payload["realized_cost"]["replacement"] == "retrieval_aware.ledger"
+
+    def test_real_smartcrusher_identical_emissions_retrieve_and_charge_independently(self, client):
+        from headroom.ccr.retrieval_reference import references_in_text
+        from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+        from headroom.transforms.retrieval_aware_policy import (
+            enable_compression_cost_tracking,
+            get_compression_cost_ledger,
+        )
+
+        ledger = get_compression_cost_ledger()
+        ledger.clear()
+        enable_compression_cost_tracking(True)
+        # Mixed severity provides a deterministic lossy signal; a uniform
+        # array can intentionally take SmartCrusher's no-signal lossless path.
+        original = json.dumps(
+            [
+                {
+                    "id": index,
+                    "level": "error" if index % 30 == 0 else "info",
+                    "message": f"deterministic line {index}",
+                }
+                for index in range(80)
+            ]
+        )
+        router = ContentRouter(
+            ContentRouterConfig(
+                retrieval_aware_enabled=True,
+                retrieval_aware_forced_action="lossy",
+                smart_crusher_with_compaction=False,
+                smart_crusher_max_items_after_crush=8,
+                enable_kompress=False,
+            )
+        )
+
+        emissions = []
+        for index in range(2):
+            result = router.compress(
+                original,
+                context="list catalog records",
+                tool_name="catalog_reader",
+                attribution={
+                    "session_id": f"session-real-{index}",
+                    "request_id": f"request-real-{index}",
+                    "tool_call_id": f"call-real-{index}",
+                    "provider_slot": f"message[{index}].content",
+                    "recovery_payload_path": "openai_chat",
+                },
+            )
+            references = references_in_text(result.compressed)
+            assert references, result.compressed
+            assert len(result.compression_event_ids) == 1
+            emissions.append(
+                (
+                    result.compression_event_ids[0],
+                    references[0],
+                )
+            )
+
+        assert emissions[0][1].hash_key == emissions[1][1].hash_key
+        assert emissions[0][1].retrieval_handle != emissions[1][1].retrieval_handle
+
+        for index, (_event_id, reference) in enumerate(emissions):
+            response = client.post(
+                "/v1/retrieve/tool_call",
+                json={
+                    "provider": "openai",
+                    "tool_call": {
+                        "id": f"recover-real-{index}",
+                        "type": "function",
+                        "function": {
+                            "name": "headroom_retrieve",
+                            "arguments": json.dumps(
+                                {
+                                    "hash": reference.hash_key,
+                                    "handle": reference.retrieval_handle,
+                                }
+                            ),
+                        },
+                    },
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["success"] is True
+            assert json.loads(response.json()["data"]["original_content"]) == json.loads(original)
+            _acknowledge_model_injection(client, response)
+
+        recent = {row["compression_event_id"]: row for row in ledger.snapshot()["recent"]}
+        for event_id, _reference in emissions:
+            assert recent[event_id]["retrieval_count"] == 1
+            assert recent[event_id]["recovery_payload_tokens"] > 0
+
+    def test_tool_call_retry_reuses_accounting_event_id(self, client):
+        ledger = _seed_retrieval_accounting()
+        request = _anthropic_retrieve_call("abc123def456", call_id="stable-provider-call")
+        first = client.post("/v1/retrieve/tool_call", json=request)
+        second = client.post("/v1/retrieve/tool_call", json=request)
+
+        assert first.json()["success"] is True
+        assert second.json()["success"] is True
+        assert first.json()["accounting"]["report"] == second.json()["accounting"]["report"]
+        assert ledger.snapshot()["actual_recovery_events"] == 0
+
+        first_ack = _acknowledge_model_injection(client, first)
+        second_ack = _acknowledge_model_injection(client, second)
+
+        assert first_ack.json()["status"] == "attributed"
+        assert second_ack.json()["status"] == "duplicate"
+        snapshot = ledger.snapshot()
+        assert snapshot["actual_recovery_events"] == 1
+        assert snapshot["attribution"]["duplicate_retrieval_reports"] == 1
+        entry = get_compression_store().retrieve_for_internal_use("abc123def456")
+        assert entry is not None
+        assert entry.retrieval_count == 1

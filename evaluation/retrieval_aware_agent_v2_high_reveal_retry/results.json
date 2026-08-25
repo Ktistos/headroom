@@ -1,0 +1,477 @@
+{
+  "aggregates": {
+    "all:always_lossless": {
+      "actual_recovery_events": 0.0,
+      "api_requests": 6.0,
+      "gross_savings_tokens": 1890.0,
+      "passed": 1,
+      "payload_net_savings_tokens": 1890.0,
+      "recovery_payload_tokens": 0.0,
+      "retrieval_calls": 0.0,
+      "runs": 1,
+      "selected_actions": {
+        "lossless": 1
+      },
+      "trajectory_cached_input_tokens": 80640.0,
+      "trajectory_input_tokens": 92101.0,
+      "trajectory_output_tokens": 804.0,
+      "wall_time": 33.136
+    },
+    "all:historical_lossy": {
+      "actual_recovery_events": 1.0,
+      "api_requests": 10.0,
+      "gross_savings_tokens": 5358.0,
+      "passed": 1,
+      "payload_net_savings_tokens": -76.0,
+      "recovery_payload_tokens": 5434.0,
+      "retrieval_calls": 1.0,
+      "runs": 1,
+      "selected_actions": {
+        "lossy": 1
+      },
+      "trajectory_cached_input_tokens": 156416.0,
+      "trajectory_input_tokens": 179938.0,
+      "trajectory_output_tokens": 2061.0,
+      "wall_time": 68.824
+    },
+    "all:retrieval_aware": {
+      "actual_recovery_events": 0.0,
+      "api_requests": 6.0,
+      "gross_savings_tokens": 1890.0,
+      "passed": 1,
+      "payload_net_savings_tokens": 1890.0,
+      "recovery_payload_tokens": 0.0,
+      "retrieval_calls": 0.0,
+      "runs": 1,
+      "selected_actions": {
+        "lossless": 1
+      },
+      "trajectory_cached_input_tokens": 80640.0,
+      "trajectory_input_tokens": 92738.0,
+      "trajectory_output_tokens": 940.0,
+      "wall_time": 38.621
+    },
+    "high_retrieval:always_lossless": {
+      "actual_recovery_events": 0.0,
+      "api_requests": 6.0,
+      "gross_savings_tokens": 1890.0,
+      "passed": 1,
+      "payload_net_savings_tokens": 1890.0,
+      "recovery_payload_tokens": 0.0,
+      "retrieval_calls": 0.0,
+      "runs": 1,
+      "selected_actions": {
+        "lossless": 1
+      },
+      "trajectory_cached_input_tokens": 80640.0,
+      "trajectory_input_tokens": 92101.0,
+      "trajectory_output_tokens": 804.0,
+      "wall_time": 33.136
+    },
+    "high_retrieval:historical_lossy": {
+      "actual_recovery_events": 1.0,
+      "api_requests": 10.0,
+      "gross_savings_tokens": 5358.0,
+      "passed": 1,
+      "payload_net_savings_tokens": -76.0,
+      "recovery_payload_tokens": 5434.0,
+      "retrieval_calls": 1.0,
+      "runs": 1,
+      "selected_actions": {
+        "lossy": 1
+      },
+      "trajectory_cached_input_tokens": 156416.0,
+      "trajectory_input_tokens": 179938.0,
+      "trajectory_output_tokens": 2061.0,
+      "wall_time": 68.824
+    },
+    "high_retrieval:retrieval_aware": {
+      "actual_recovery_events": 0.0,
+      "api_requests": 6.0,
+      "gross_savings_tokens": 1890.0,
+      "passed": 1,
+      "payload_net_savings_tokens": 1890.0,
+      "recovery_payload_tokens": 0.0,
+      "retrieval_calls": 0.0,
+      "runs": 1,
+      "selected_actions": {
+        "lossless": 1
+      },
+      "trajectory_cached_input_tokens": 80640.0,
+      "trajectory_input_tokens": 92738.0,
+      "trajectory_output_tokens": 940.0,
+      "wall_time": 38.621
+    }
+  },
+  "codex_version": "codex-cli 0.147.0",
+  "conditions": [
+    "historical_lossy",
+    "always_lossless",
+    "retrieval_aware"
+  ],
+  "model": "gpt-5.4",
+  "reasoning_effort": "low",
+  "runs": [
+    {
+      "actual": {
+        "bucket": "b2",
+        "index": 121,
+        "note": "catalog-note-918",
+        "status": "ready",
+        "token": "code-00",
+        "value": 10
+      },
+      "actual_recovery_events": 1,
+      "api_requests": 10,
+      "benchmark_valid": true,
+      "catalog_command_events": 1,
+      "codex_exit_code": 0,
+      "condition": "historical_lossy",
+      "direct_store_access": false,
+      "expected": {
+        "bucket": "b2",
+        "index": 121,
+        "note": "catalog-note-918",
+        "status": "ready",
+        "token": "code-00",
+        "value": 10
+      },
+      "external_artifact_search": false,
+      "gross_savings_tokens": 5358,
+      "hidden_grader_pass": true,
+      "ledger": {
+        "action_counts": {
+          "lossless": 0,
+          "lossy": 1,
+          "passthrough": 0
+        },
+        "actual_recovery_events": 1,
+        "attribution": {
+          "ambiguous_attributions": 0,
+          "attributed_retrieval_reports": 1,
+          "dropped_attribution_candidates": 0,
+          "dropped_retrieval_reports": 0,
+          "duplicate_retrieval_reports": 0,
+          "internal_store_accesses": 0,
+          "rejected_retrieval_reports": 0,
+          "retrieval_call_observations": 0,
+          "unattributed_retrieval_reports": 0
+        },
+        "by_tool": {
+          "exec_command": {
+            "average_compressed_ratio": 1.0,
+            "average_retrieval_count": 0.0,
+            "gross_savings_tokens": 0,
+            "initially_emitted_tokens": 0,
+            "mature_compressions": 0,
+            "original_tokens": 0,
+            "payload_net_savings_tokens": 0,
+            "pending_compressions": 0,
+            "recovery_payload_tokens": 0,
+            "retrieval_count": 0,
+            "retrieval_rate": 0.0,
+            "retrieved_compressions": 0
+          }
+        },
+        "events": 1,
+        "gross_savings_tokens": 5358,
+        "mature_lossy_events": 0,
+        "payload_net_savings_tokens": -76,
+        "pending_lossy_events": 0,
+        "recent": [
+          {
+            "action": "lossy",
+            "compression_event_id": "ce-c3e955e8-18d4-4aba-9b53-2d86e351504e",
+            "created_at": 1786972442.915873,
+            "eligible_for_learning": false,
+            "gross_savings_tokens": 5358,
+            "hashes": [
+              "d49c866b448d"
+            ],
+            "initially_emitted_tokens": 981,
+            "mature": true,
+            "maturity_deadline": 1786972442.915873,
+            "original_tokens": 6339,
+            "payload_net_savings_tokens": -76,
+            "predicted_action": "lossless",
+            "recovery_payload_tokens": 5434,
+            "request_id": "hr_1786972442_000003",
+            "retrieval_count": 1,
+            "session_id": "",
+            "strategy": "smart_sample(180->39)",
+            "tool_call_id": "call_H26hWoiQf7HqZgN7gqn7UXUJ",
+            "tool_name": "exec_command"
+          }
+        ],
+        "recovery_payload_tokens": 5434
+      },
+      "payload_net_savings_tokens": -76,
+      "policy_exercised": true,
+      "predicted_action": "lossless",
+      "recovery_payload_tokens": 5434,
+      "regime": "high_retrieval",
+      "retrieval_calls": 1,
+      "run_index": 1,
+      "selected_action": "lossy",
+      "source_inspection": false,
+      "success": true,
+      "target_after_catalog": true,
+      "target_command_events": 1,
+      "task": {
+        "command_label": "exact",
+        "name": "high_middle_beta",
+        "regime": "high_retrieval",
+        "row_count": 180,
+        "seed": 2927455522424617784,
+        "target_index": 121
+      },
+      "termination_reason": null,
+      "tool_events": 9,
+      "trajectory_cached_input_tokens": 156416,
+      "trajectory_input_tokens": 179938,
+      "trajectory_output_tokens": 2061,
+      "valid_attribution_path": true,
+      "wall_time": 68.824
+    },
+    {
+      "actual": {
+        "bucket": "b2",
+        "index": 121,
+        "note": "catalog-note-918",
+        "status": "ready",
+        "token": "code-00",
+        "value": 10
+      },
+      "actual_recovery_events": 0,
+      "api_requests": 6,
+      "benchmark_valid": true,
+      "catalog_command_events": 1,
+      "codex_exit_code": 0,
+      "condition": "always_lossless",
+      "direct_store_access": false,
+      "expected": {
+        "bucket": "b2",
+        "index": 121,
+        "note": "catalog-note-918",
+        "status": "ready",
+        "token": "code-00",
+        "value": 10
+      },
+      "external_artifact_search": false,
+      "gross_savings_tokens": 1890,
+      "hidden_grader_pass": true,
+      "ledger": {
+        "action_counts": {
+          "lossless": 1,
+          "lossy": 0,
+          "passthrough": 0
+        },
+        "actual_recovery_events": 0,
+        "attribution": {
+          "ambiguous_attributions": 0,
+          "attributed_retrieval_reports": 0,
+          "dropped_attribution_candidates": 0,
+          "dropped_retrieval_reports": 0,
+          "duplicate_retrieval_reports": 0,
+          "internal_store_accesses": 0,
+          "rejected_retrieval_reports": 0,
+          "retrieval_call_observations": 0,
+          "unattributed_retrieval_reports": 0
+        },
+        "by_tool": {
+          "exec_command": {
+            "average_compressed_ratio": 1.0,
+            "average_retrieval_count": 0.0,
+            "gross_savings_tokens": 0,
+            "initially_emitted_tokens": 0,
+            "mature_compressions": 0,
+            "original_tokens": 0,
+            "payload_net_savings_tokens": 0,
+            "pending_compressions": 0,
+            "recovery_payload_tokens": 0,
+            "retrieval_count": 0,
+            "retrieval_rate": 0.0,
+            "retrieved_compressions": 0
+          }
+        },
+        "events": 1,
+        "gross_savings_tokens": 1890,
+        "mature_lossy_events": 0,
+        "payload_net_savings_tokens": 1890,
+        "pending_lossy_events": 0,
+        "recent": [
+          {
+            "action": "lossless",
+            "compression_event_id": "ce-7434d5c8-caa0-48b2-9fbb-2bd78cc5e38b",
+            "created_at": 1786972512.60633,
+            "eligible_for_learning": true,
+            "gross_savings_tokens": 1890,
+            "hashes": [],
+            "initially_emitted_tokens": 4449,
+            "mature": true,
+            "maturity_deadline": 1786972512.60633,
+            "original_tokens": 6339,
+            "payload_net_savings_tokens": 1890,
+            "predicted_action": "lossless",
+            "recovery_payload_tokens": 0,
+            "request_id": "hr_1786972512_000003",
+            "retrieval_count": 0,
+            "session_id": "",
+            "strategy": "retrieval_aware_lossless",
+            "tool_call_id": "call_YNnFSnTPjJsVZ9hMY760lHMo",
+            "tool_name": "exec_command"
+          }
+        ],
+        "recovery_payload_tokens": 0
+      },
+      "payload_net_savings_tokens": 1890,
+      "policy_exercised": true,
+      "predicted_action": "lossless",
+      "recovery_payload_tokens": 0,
+      "regime": "high_retrieval",
+      "retrieval_calls": 0,
+      "run_index": 2,
+      "selected_action": "lossless",
+      "source_inspection": false,
+      "success": true,
+      "target_after_catalog": true,
+      "target_command_events": 1,
+      "task": {
+        "command_label": "exact",
+        "name": "high_middle_beta",
+        "regime": "high_retrieval",
+        "row_count": 180,
+        "seed": 2927455522424617784,
+        "target_index": 121
+      },
+      "termination_reason": null,
+      "tool_events": 5,
+      "trajectory_cached_input_tokens": 80640,
+      "trajectory_input_tokens": 92101,
+      "trajectory_output_tokens": 804,
+      "valid_attribution_path": true,
+      "wall_time": 33.136
+    },
+    {
+      "actual": {
+        "bucket": "b2",
+        "index": 121,
+        "note": "catalog-note-918",
+        "status": "ready",
+        "token": "code-00",
+        "value": 10
+      },
+      "actual_recovery_events": 0,
+      "api_requests": 6,
+      "benchmark_valid": true,
+      "catalog_command_events": 1,
+      "codex_exit_code": 0,
+      "condition": "retrieval_aware",
+      "direct_store_access": false,
+      "expected": {
+        "bucket": "b2",
+        "index": 121,
+        "note": "catalog-note-918",
+        "status": "ready",
+        "token": "code-00",
+        "value": 10
+      },
+      "external_artifact_search": false,
+      "gross_savings_tokens": 1890,
+      "hidden_grader_pass": true,
+      "ledger": {
+        "action_counts": {
+          "lossless": 1,
+          "lossy": 0,
+          "passthrough": 0
+        },
+        "actual_recovery_events": 0,
+        "attribution": {
+          "ambiguous_attributions": 0,
+          "attributed_retrieval_reports": 0,
+          "dropped_attribution_candidates": 0,
+          "dropped_retrieval_reports": 0,
+          "duplicate_retrieval_reports": 0,
+          "internal_store_accesses": 0,
+          "rejected_retrieval_reports": 0,
+          "retrieval_call_observations": 0,
+          "unattributed_retrieval_reports": 0
+        },
+        "by_tool": {
+          "exec_command": {
+            "average_compressed_ratio": 1.0,
+            "average_retrieval_count": 0.0,
+            "gross_savings_tokens": 0,
+            "initially_emitted_tokens": 0,
+            "mature_compressions": 0,
+            "original_tokens": 0,
+            "payload_net_savings_tokens": 0,
+            "pending_compressions": 0,
+            "recovery_payload_tokens": 0,
+            "retrieval_count": 0,
+            "retrieval_rate": 0.0,
+            "retrieved_compressions": 0
+          }
+        },
+        "events": 1,
+        "gross_savings_tokens": 1890,
+        "mature_lossy_events": 0,
+        "payload_net_savings_tokens": 1890,
+        "pending_lossy_events": 0,
+        "recent": [
+          {
+            "action": "lossless",
+            "compression_event_id": "ce-79bfb86c-42e8-44f3-8df9-73058971c271",
+            "created_at": 1786972552.2246335,
+            "eligible_for_learning": true,
+            "gross_savings_tokens": 1890,
+            "hashes": [],
+            "initially_emitted_tokens": 4449,
+            "mature": true,
+            "maturity_deadline": 1786972552.2246335,
+            "original_tokens": 6339,
+            "payload_net_savings_tokens": 1890,
+            "predicted_action": "lossless",
+            "recovery_payload_tokens": 0,
+            "request_id": "hr_1786972552_000003",
+            "retrieval_count": 0,
+            "session_id": "",
+            "strategy": "retrieval_aware_lossless",
+            "tool_call_id": "call_ShM5Mb98Z48mktuZqmIOE7uF",
+            "tool_name": "exec_command"
+          }
+        ],
+        "recovery_payload_tokens": 0
+      },
+      "payload_net_savings_tokens": 1890,
+      "policy_exercised": true,
+      "predicted_action": "lossless",
+      "recovery_payload_tokens": 0,
+      "regime": "high_retrieval",
+      "retrieval_calls": 0,
+      "run_index": 3,
+      "selected_action": "lossless",
+      "source_inspection": false,
+      "success": true,
+      "target_after_catalog": true,
+      "target_command_events": 1,
+      "task": {
+        "command_label": "exact",
+        "name": "high_middle_beta",
+        "regime": "high_retrieval",
+        "row_count": 180,
+        "seed": 2927455522424617784,
+        "target_index": 121
+      },
+      "termination_reason": null,
+      "tool_events": 6,
+      "trajectory_cached_input_tokens": 80640,
+      "trajectory_input_tokens": 92738,
+      "trajectory_output_tokens": 940,
+      "valid_attribution_path": true,
+      "wall_time": 38.621
+    }
+  ],
+  "schema_version": 2,
+  "seed_mode": "fresh_random"
+}

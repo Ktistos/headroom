@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 # row-offload form `<<ccr:HASH N_rows_offloaded>>`) emitted by SmartCrusher.
 # HASH is 12-24 hex chars; see headroom/ccr/tool_injection.py for the same
 # constant used on the injection side.
-_MARKER_RE = re.compile(r"<<ccr:([a-f0-9]{12,24})[^>]*>>")
+_MARKER_RE = re.compile(
+    r"<<ccr:([a-f0-9]{12,24})(?:@(rh-[a-f0-9]{32}))?[^>]*>>",
+    re.IGNORECASE,
+)
 
 
 def resolve_markers_in_text(text: str, *, store: CompressionStore | None = None) -> str:
@@ -47,11 +50,29 @@ def resolve_markers_in_text(text: str, *, store: CompressionStore | None = None)
     resolved_store = store or get_compression_store()
 
     def _replace(match: re.Match[str]) -> str:
-        hash_key = match.group(1)
-        entry = resolved_store.retrieve(hash_key)
+        hash_key = match.group(1).lower()
+        retrieval_handle = (match.group(2) or "").lower()
+        entry = resolved_store.retrieve_for_internal_use(
+            hash_key,
+            retrieval_handle=retrieval_handle or None,
+        )
         if entry is not None:
             original = entry.original_content
-            return original if isinstance(original, str) else json.dumps(original)
+            rendered = original if isinstance(original, str) else json.dumps(original)
+            try:
+                from ..transforms.retrieval_aware_policy import (
+                    compression_cost_tracking_enabled,
+                    estimate_payload_tokens,
+                    get_compression_cost_ledger,
+                )
+
+                if compression_cost_tracking_enabled():
+                    get_compression_cost_ledger().record_client_inline_expansion(
+                        estimate_payload_tokens(rendered)
+                    )
+            except Exception:
+                logger.debug("Inline client-expansion accounting failed", exc_info=True)
+            return rendered
 
         get_status = getattr(resolved_store, "get_entry_status", None)
         status = get_status(hash_key, clean_expired=True) if callable(get_status) else None

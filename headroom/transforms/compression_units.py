@@ -8,6 +8,7 @@ replacements back into their native request shape.
 
 from __future__ import annotations
 
+import inspect
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -17,6 +18,8 @@ from .content_router import (
     CompressionStrategy,
     ContentRouter,
     RouterCompressionResult,
+    _adopt_policy_passthrough,
+    policy_side_effect_transaction,
 )
 
 
@@ -145,38 +148,116 @@ def _compress_live_text_with_markers(
 
     parts: list[str] = []
     transforms: list[str] = []
+    router_results: list[RouterCompressionResult] = []
     last_end = 0
-    last_router_result: RouterCompressionResult | None = None
 
-    for match in _CCR_MARKER_RE.finditer(unit.text):
-        prefix = unit.text[last_end : match.start()]
-        if prefix:
-            compressed_prefix, prefix_transforms, last_router_result = _compress_marker_free_text(
-                prefix,
+    try:
+        for match in _CCR_MARKER_RE.finditer(unit.text):
+            prefix = unit.text[last_end : match.start()]
+            if prefix:
+                compressed_prefix, prefix_transforms, prefix_result = _compress_marker_free_text(
+                    prefix,
+                    unit=unit,
+                    router=router,
+                )
+                if prefix_result is not None:
+                    router_results.append(prefix_result)
+                parts.append(compressed_prefix)
+                transforms.extend(prefix_transforms)
+            parts.append(match.group(0))
+            last_end = match.end()
+
+        suffix = unit.text[last_end:]
+        if suffix:
+            compressed_suffix, suffix_transforms, suffix_result = _compress_marker_free_text(
+                suffix,
                 unit=unit,
                 router=router,
-                last_router_result=last_router_result,
             )
-            parts.append(compressed_prefix)
-            transforms.extend(prefix_transforms)
-        parts.append(match.group(0))
-        last_end = match.end()
-
-    suffix = unit.text[last_end:]
-    if suffix:
-        compressed_suffix, suffix_transforms, last_router_result = _compress_marker_free_text(
-            suffix,
-            unit=unit,
-            router=router,
-            last_router_result=last_router_result,
-        )
-        parts.append(compressed_suffix)
-        transforms.extend(suffix_transforms)
+            if suffix_result is not None:
+                router_results.append(suffix_result)
+            parts.append(compressed_suffix)
+            transforms.extend(suffix_transforms)
+    except Exception:
+        # The provider unit is emitted atomically. If a later span fails, none
+        # of the earlier span results can reach the provider, so reconcile all
+        # policy/store candidates created so far before propagating the error.
+        _discard_unemitted_policy_events(_combine_router_results(router_results), router)
+        raise
 
     if transforms:
         transforms.insert(0, "ccr_marker_preserving")
 
-    return "".join(parts), transforms, last_router_result
+    replacement = "".join(parts)
+    return (
+        replacement,
+        transforms,
+        _combine_router_results(
+            router_results,
+            original=unit.text,
+            compressed=replacement,
+        ),
+    )
+
+
+def _combine_router_results(
+    results: list[RouterCompressionResult],
+    *,
+    original: str | None = None,
+    compressed: str | None = None,
+) -> RouterCompressionResult | None:
+    """Combine independently compressed spans into one attributable result."""
+
+    if not results:
+        return None
+    event_ids = list(
+        dict.fromkeys(
+            event_id for result in results for event_id in result.compression_event_ids if event_id
+        )
+    )
+    event_hashes = {
+        event_id: tuple(hashes)
+        for result in results
+        for event_id, hashes in result.compression_event_hashes.items()
+    }
+    return replace(
+        results[-1],
+        original=results[-1].original if original is None else original,
+        compressed=results[-1].compressed if compressed is None else compressed,
+        routing_log=[decision for result in results for decision in result.routing_log],
+        sections_processed=sum(result.sections_processed for result in results),
+        strategy_chain=[strategy for result in results for strategy in result.strategy_chain],
+        cache_hit=all(result.cache_hit for result in results),
+        compression_event_ids=event_ids,
+        compression_event_hashes=event_hashes,
+    )
+
+
+def _router_attribution_kwargs(
+    router: ContentRouter, metadata: dict[str, str]
+) -> dict[str, dict[str, str]]:
+    try:
+        supported = "attribution" in inspect.signature(router.compress).parameters
+    except (TypeError, ValueError):
+        supported = False
+    return {"attribution": metadata} if supported else {}
+
+
+def _discard_unemitted_policy_events(
+    router_result: RouterCompressionResult | None, router: ContentRouter
+) -> None:
+    if router_result is None or not router_result.compression_event_ids:
+        return
+    # Use the same reconciliation path as ContentRouter's own outer gates.
+    # Merely changing the ledger action would leave a never-emitted producer
+    # in the shared CCR store, making later same-content hash-only retrievals
+    # ambiguous.
+    _adopt_policy_passthrough(
+        router,
+        router_result.compression_event_ids,
+        strategy="provider_unit_gate_passthrough",
+        event_hashes=router_result.compression_event_hashes,
+    )
 
 
 def _compress_marker_free_text(
@@ -184,21 +265,22 @@ def _compress_marker_free_text(
     *,
     unit: CompressionUnit,
     router: ContentRouter,
-    last_router_result: RouterCompressionResult | None,
 ) -> tuple[str, list[str], RouterCompressionResult | None]:
     boundary = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
     if boundary is None:
-        return text, [], last_router_result
+        return text, [], None
 
     leading, core, trailing = boundary.groups()
     if len(core.encode("utf-8", errors="replace")) < unit.min_bytes:
-        return text, [], last_router_result
+        return text, [], None
 
     router_result = router.compress(
         core,
         context=unit.context,
         question=unit.question,
         bias=unit.bias,
+        tool_name=unit.metadata.get("tool_name") or None,
+        **_router_attribution_kwargs(router, unit.metadata),
     )
     if router_result.compressed == core:
         return text, [], router_result
@@ -215,6 +297,22 @@ def _compress_marker_free_text(
 
 
 def compress_unit_with_router(
+    unit: CompressionUnit,
+    *,
+    router: ContentRouter,
+    tokenizer: TokenCounterLike,
+    target_ratio: float | None = None,
+) -> UnitCompressionResult:
+    with policy_side_effect_transaction():
+        return _compress_unit_with_router_in_transaction(
+            unit,
+            router=router,
+            tokenizer=tokenizer,
+            target_ratio=target_ratio,
+        )
+
+
+def _compress_unit_with_router_in_transaction(
     unit: CompressionUnit,
     *,
     router: ContentRouter,
@@ -286,6 +384,7 @@ def compress_unit_with_router(
 
         tokens_after = tokenizer.count_text(replacement)
         if tokens_after >= tokens_before:
+            _discard_unemitted_policy_events(router_result, router)
             return _with_reason(
                 compressed=replacement,
                 tokens_after=tokens_after,
@@ -315,6 +414,8 @@ def compress_unit_with_router(
             context=unit.context,
             question=unit.question,
             bias=unit.bias,
+            tool_name=unit.metadata.get("tool_name") or None,
+            **_router_attribution_kwargs(router, unit.metadata),
         )
     finally:
         if target_ratio is not None:
@@ -330,6 +431,7 @@ def compress_unit_with_router(
 
     tokens_after = tokenizer.count_text(replacement)
     if tokens_after >= tokens_before:
+        _discard_unemitted_policy_events(router_result, router)
         return _with_reason(
             compressed=replacement,
             tokens_after=tokens_after,
@@ -345,6 +447,7 @@ def compress_unit_with_router(
         and strategy in _LOSSY_UNMARKED_STRATEGIES
     ):
         if not _CCR_MARKER_RE.search(replacement):
+            _discard_unemitted_policy_events(router_result, router)
             return _with_reason(
                 strategy=strategy,
                 router_result=router_result,

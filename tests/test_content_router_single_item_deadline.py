@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 import time
 
 import headroom.transforms.kompress_compressor as kc
@@ -97,6 +99,44 @@ def test_single_cache_miss_preserves_under_deadline_output(monkeypatch):
     assert result.messages[1]["content"] == "compressed output"
 
 
+def test_single_cache_miss_effects_wait_for_request_holder(monkeypatch):
+    from headroom.transforms.content_router import (
+        _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION,
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+    )
+
+    router = _router()
+    state = {"discarded": 0, "committed": 0}
+
+    def compress(content, *, context="", bias=1.0):
+        transaction = _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION.get()
+        assert transaction is not None
+        transaction.register(
+            "request-owned-deadline-effect",
+            commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+            discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+        )
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", compress)
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "1000")
+    holder = RequestPolicySideEffectHolder()
+
+    with activate_request_policy_side_effect_holder(holder):
+        result = router.apply(
+            _messages(),
+            _Tokenizer(),
+            frozen_message_count=1,
+            min_tokens_to_compress=1,
+        )
+        assert result.messages[1]["content"] == "compressed output"
+        assert state == {"discarded": 0, "committed": 0}
+
+    holder.finalize(commit=False)
+    assert state == {"discarded": 1, "committed": 0}
+
+
 def test_single_cache_miss_preserves_disabled_deadline(monkeypatch):
     router = _router()
     monkeypatch.setattr(
@@ -182,3 +222,200 @@ def test_single_cache_miss_deadline_starts_before_kompress_load(monkeypatch, cap
     assert "failing open via PASSTHROUGH" in caplog.text
     assert load_state["calls"] == 1
     assert model.calls == 0
+
+
+def test_single_cache_miss_deadline_discards_late_policy_effects(monkeypatch):
+    from headroom.transforms.content_router import _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION
+
+    router = _router()
+    state = {"discarded": 0, "committed": 0}
+    finished = threading.Event()
+
+    def slow_compress(content, *, context="", bias=1.0):
+        time.sleep(0.05)
+        transaction = _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION.get()
+        assert transaction is not None
+        transaction.register(
+            "late-event",
+            commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+            discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+        )
+        finished.set()
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", slow_compress)
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "5")
+
+    result = router.apply(
+        _messages(),
+        _Tokenizer(),
+        frozen_message_count=1,
+        min_tokens_to_compress=1,
+    )
+
+    assert result.messages[1]["content"] == _messages()[1]["content"]
+    assert finished.wait(timeout=1.0)
+    assert state == {"discarded": 1, "committed": 0}
+
+
+def test_deadline_reconciles_real_policy_ledger_store_and_toin(monkeypatch):
+    from headroom.cache.compression_store import (
+        get_compression_store,
+        reset_compression_store,
+    )
+    from headroom.transforms.retrieval_aware_policy import get_compression_cost_ledger
+    from headroom.transforms.smart_crusher import CrushResult
+
+    monkeypatch.setenv("HEADROOM_CCR_BACKEND", "memory")
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "5")
+    reset_compression_store()
+    store = get_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    router = ContentRouter(
+        ContentRouterConfig(
+            retrieval_aware_enabled=True,
+            retrieval_aware_forced_action="lossy",
+            protect_recent_code=0,
+            protect_analysis_context=False,
+            exclude_tools=set(),
+        )
+    )
+    toin_calls: list[dict] = []
+    hash_key = "abcdef123456abcdef123456"
+
+    class _Crusher:
+        def crush(self, content, **kwargs):
+            if kwargs.get("lossless_only"):
+                return CrushResult(
+                    json.dumps(json.loads(content), separators=(",", ":")),
+                    content,
+                    True,
+                    "lossless_json",
+                )
+            handle = kwargs["retrieval_handle"]
+            marker = json.dumps([{"_ccr": f"<<ccr:{hash_key}@{handle}>>"}])
+            store.store(
+                content,
+                marker,
+                explicit_hash=hash_key,
+                compression_event_id=kwargs["compression_event_id"],
+                retrieval_handle=handle,
+            )
+            return CrushResult(marker, content, True, "row_drop")
+
+        def _record_to_toin(self, **kwargs):
+            toin_calls.append(kwargs)
+
+    router._get_smart_crusher = lambda: _Crusher()
+    original_compress = router.compress
+
+    def slow_compress(content, **kwargs):
+        time.sleep(0.05)
+        return original_compress(content, **kwargs)
+
+    monkeypatch.setattr(router, "compress", slow_compress)
+    content = json.dumps([{"id": i, "value": "x" * 20} for i in range(80)])
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "catalog", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": content},
+    ]
+
+    try:
+        result = router.apply(
+            messages,
+            _Tokenizer(),
+            min_tokens_to_compress=1,
+            request_id="request-1",
+            session_id="session-1",
+        )
+        time.sleep(0.12)
+        snapshot = ledger.snapshot()
+
+        assert result.messages[1]["content"] == content
+        assert snapshot["action_counts"] == {
+            "passthrough": 1,
+            "lossless": 0,
+            "lossy": 0,
+        }
+        assert store.retrieve_for_internal_use(hash_key) is None
+        assert toin_calls == []
+    finally:
+        ledger.clear()
+        reset_compression_store()
+
+
+def test_single_cache_miss_propagates_request_scoped_store(monkeypatch):
+    from headroom.cache.compression_store import (
+        CompressionStore,
+        clear_request_compression_store,
+        get_compression_store,
+        set_request_compression_store,
+    )
+
+    router = _router()
+    scoped_store = CompressionStore()
+    observed: list[bool] = []
+
+    def compress(content, *, context="", bias=1.0):
+        observed.append(get_compression_store() is scoped_store)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", compress)
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "1000")
+    set_request_compression_store(scoped_store)
+    try:
+        result = router.apply(
+            _messages(),
+            _Tokenizer(),
+            frozen_message_count=1,
+            min_tokens_to_compress=1,
+        )
+    finally:
+        clear_request_compression_store()
+
+    assert result.messages[1]["content"] == "compressed output"
+    assert observed == [True]
+
+
+def test_deadline_passthrough_does_not_poison_skip_cache(monkeypatch):
+    router = _router()
+    calls = {"count": 0}
+
+    def compress(content, *, context="", bias=1.0):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            time.sleep(0.05)
+        return _compression_result(content, "compressed output")
+
+    monkeypatch.setattr(router, "compress", compress)
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "5")
+    first = router.apply(
+        _messages(),
+        _Tokenizer(),
+        frozen_message_count=1,
+        min_tokens_to_compress=1,
+    )
+    assert first.messages[1]["content"] == _messages()[1]["content"]
+    time.sleep(0.08)
+
+    monkeypatch.setenv("HEADROOM_COMPRESSION_DEADLINE_MS", "1000")
+    second = router.apply(
+        _messages(),
+        _Tokenizer(),
+        frozen_message_count=1,
+        min_tokens_to_compress=1,
+    )
+
+    assert second.messages[1]["content"] == "compressed output"
+    assert calls["count"] == 2

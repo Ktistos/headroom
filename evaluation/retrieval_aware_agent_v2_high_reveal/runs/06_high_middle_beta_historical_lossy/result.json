@@ -1,0 +1,18 @@
+{
+  "benchmark_valid": false,
+  "condition": "historical_lossy",
+  "error": "ValueError: malformed node or string on line 21: <ast.Call object at 0x716ca4699e10>",
+  "hidden_grader_pass": false,
+  "regime": "high_retrieval",
+  "run_index": 6,
+  "success": false,
+  "task": {
+    "command_label": "exact",
+    "name": "high_middle_beta",
+    "regime": "high_retrieval",
+    "row_count": 180,
+    "seed": 3181966428966728432,
+    "target_index": 121
+  },
+  "wall_time": 143.31
+}

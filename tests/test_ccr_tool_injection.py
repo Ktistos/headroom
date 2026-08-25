@@ -8,6 +8,7 @@ from headroom.ccr import (
     create_ccr_tool_definition,
     create_system_instructions,
     parse_tool_call,
+    parse_tool_call_reference,
 )
 
 
@@ -76,6 +77,25 @@ class TestCCRToolInjector:
         assert "abc123def456abc123def456" in hashes
         assert injector.has_compressed_content
 
+    def test_scan_for_markers_ignores_malformed_non_string_text_blocks(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-malformed",
+                        "content": [{"type": "text", "text": 1234}],
+                    }
+                ],
+            }
+        ]
+
+        injector = CCRToolInjector()
+
+        assert injector.scan_for_markers(messages) == []
+        assert not injector.has_compressed_content
+
     def test_scan_detects_read_lifecycle_stale_marker(self):
         """A read_lifecycle STALE marker carries a retrievable CCR hash via the
         'Retrieve original: hash=' phrase but never says 'compressed', so the
@@ -117,6 +137,26 @@ class TestCCRToolInjector:
         assert len(hashes) == 2
         assert "aaa111111111aaa111111111" in hashes
         assert "bbb222222222bbb222222222" in hashes
+
+    def test_scan_preserves_two_event_handles_for_one_content_hash(self):
+        hash_key = "abcdef123456"
+        handles = [f"rh-{index:032x}" for index in range(2)]
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(
+            [
+                {
+                    "role": "tool",
+                    "content": f"<<ccr:{hash_key}@{handle},string,1KB>>",
+                }
+                for handle in handles
+            ]
+        )
+
+        assert hashes == [hash_key]
+        assert [(ref.hash_key, ref.retrieval_handle) for ref in injector.detected_references] == [
+            (hash_key, handles[0]),
+            (hash_key, handles[1]),
+        ]
 
     def test_scan_no_duplicates(self):
         """Scanner deduplicates repeated hashes."""
@@ -342,6 +382,49 @@ class TestParseToolCall:
         hash_key = parse_tool_call(tool_call, "anthropic")
 
         assert hash_key == "abc123def456abc123def456"
+
+    def test_parse_event_handle_across_provider_tool_call_shapes(self):
+        hash_key = "abc123def456"
+        handle = "rh-0123456789abcdef0123456789abcdef"
+        calls = {
+            "anthropic": {
+                "name": CCR_TOOL_NAME,
+                "input": {"hash": hash_key, "handle": handle},
+            },
+            "openai": {
+                "function": {
+                    "name": CCR_TOOL_NAME,
+                    "arguments": json.dumps({"hash": hash_key, "handle": handle}),
+                }
+            },
+            "openai_responses": {
+                "name": CCR_TOOL_NAME,
+                "arguments": json.dumps({"hash": hash_key, "handle": handle}),
+            },
+            "google": {
+                "functionCall": {
+                    "name": CCR_TOOL_NAME,
+                    "args": {"hash": hash_key, "handle": handle},
+                }
+            },
+        }
+        for provider, call in calls.items():
+            reference = parse_tool_call_reference(call, provider)
+            assert reference is not None
+            assert reference.hash_key == hash_key
+            assert reference.retrieval_handle == handle
+
+    def test_parse_rejects_malformed_event_handle(self):
+        assert (
+            parse_tool_call_reference(
+                {
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": "abc123def456", "handle": "session-secret"},
+                },
+                "anthropic",
+            )
+            is None
+        )
 
     def test_parse_non_ccr_tool(self):
         """Returns None for non-CCR tool calls."""

@@ -1,15 +1,26 @@
 from __future__ import annotations
 
+import json
 import threading
 from types import MethodType, SimpleNamespace
 
+from headroom.cache.compression_store import CompressionStore
 from headroom.proxy.handlers import openai as openai_handler
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
-from headroom.transforms.compression_units import UnitCompressionResult
+from headroom.transforms.compression_units import (
+    CompressionUnit,
+    UnitCompressionResult,
+    compress_unit_with_router,
+)
 from headroom.transforms.content_router import (
     CompressionStrategy,
     ContentRouter,
     RouterCompressionResult,
+)
+from headroom.transforms.retrieval_aware_policy import (
+    CompressionAction,
+    CompressionCostLedger,
+    RetrievalAwarePolicy,
 )
 
 
@@ -25,6 +36,62 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
         get_token_counter=lambda _model: TokenCounter(),
     )
     return handler
+
+
+def test_rejected_responses_unit_removes_never_emitted_store_candidate(monkeypatch):
+    ledger = CompressionCostLedger(observation_window_seconds=0)
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=100,
+        initially_emitted_tokens=20,
+        ccr_hashes=["abcdef123456"],
+        compression_event_id="event-rejected-unit",
+    )
+    handle = ledger.new_retrieval_handle()
+    store = CompressionStore(enable_feedback=False)
+    store.store(
+        original="one two",
+        compressed=f"<<ccr:abcdef123456@{handle}>>",
+        explicit_hash="abcdef123456",
+        compression_event_id=event_id,
+        retrieval_handle=handle,
+    )
+    monkeypatch.setattr("headroom.cache.compression_store.get_compression_store", lambda: store)
+
+    router = ContentRouter()
+    router._retrieval_aware_policy = RetrievalAwarePolicy(ledger)
+    compressed = f"<<ccr:abcdef123456@{handle}>> extra words here"
+
+    def compress(self, _content, **_kwargs):
+        return RouterCompressionResult(
+            compressed=compressed,
+            original="one two",
+            strategy_used=CompressionStrategy.SMART_CRUSHER,
+            compression_event_ids=[event_id],
+        )
+
+    router.compress = MethodType(compress, router)
+    result = compress_unit_with_router(
+        CompressionUnit(
+            text="one two",
+            provider="openai",
+            endpoint="responses",
+            role="tool",
+            item_type="function_call_output",
+            min_bytes=0,
+        ),
+        router=router,
+        tokenizer=TokenCounter(),
+    )
+
+    assert result.reason == "rejected_not_smaller"
+    assert store.get_entry_status("abcdef123456")["status"] == "missing"
+    event = ledger.snapshot()["recent"][0]
+    assert event["action"] == "passthrough"
+    assert event["strategy"] == "provider_unit_gate_passthrough"
 
 
 def test_openai_responses_unit_parallelism_env_defaults_and_clamps(monkeypatch):
@@ -315,6 +382,140 @@ def test_openai_responses_adapter_batches_small_outputs_once():
     assert attempted == 120
     assert units_by_category == {"applied": 4}
     assert [item["output"] for item in new_payload["input"]] == ["x"] * 4
+
+
+def test_openai_responses_retrieval_aware_batches_preserve_distinct_call_ids():
+    router = ContentRouter()
+    router.config.retrieval_aware_enabled = True
+    outputs = [" ".join(f"unit{index}_{token}" for token in range(30)) for index in range(4)]
+
+    def compress(self, content: str, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("different tool calls must not share a policy event")
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": f"c{index}",
+                "output": output,
+            }
+            for index, output in enumerate(outputs)
+        ],
+    }
+
+    new_payload, modified, saved, _, units_by_category, _, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_retrieval_aware_batch",
+        )
+    )
+
+    assert new_payload == payload
+    assert modified is False
+    assert saved == 0
+    assert attempted == 0
+    assert units_by_category == {"size_floor": 4}
+
+
+def test_openai_responses_retrieval_aware_cache_is_scoped_per_event():
+    router = ContentRouter()
+    router.config.retrieval_aware_enabled = True
+    attributions: list[dict[str, str]] = []
+
+    def compress(self, content: str, *, attribution=None, **_kwargs):
+        attributions.append(dict(attribution or {}))
+        return RouterCompressionResult(
+            compressed="kept words",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{index}" for index in range(180))
+
+    def payload(*call_ids: str):
+        return {
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": long_text,
+                }
+                for call_id in call_ids
+            ],
+        }
+
+    handler._compress_openai_responses_live_text_units_with_router(
+        payload("call_a", "call_b"),
+        model="gpt-5",
+        request_id="request_one:frame:1",
+        session_id="session_one",
+    )
+    handler._compress_openai_responses_live_text_units_with_router(
+        payload("call_a"),
+        model="gpt-5",
+        request_id="request_one:frame:2",
+        session_id="session_one",
+    )
+
+    assert {
+        (item["request_id"], item["session_id"], item["tool_call_id"]) for item in attributions
+    } == {
+        ("request_one:frame:1", "session_one", "call_a"),
+        ("request_one:frame:1", "session_one", "call_b"),
+        ("request_one:frame:2", "session_one", "call_a"),
+    }
+    assert len(attributions) == 3
+
+
+def test_openai_responses_attribution_falls_back_to_unique_request_scope():
+    router = ContentRouter()
+    router.config.retrieval_aware_enabled = True
+    attributions: list[dict[str, str]] = []
+
+    def compress(self, content: str, *, attribution=None, **_kwargs):
+        attributions.append(dict(attribution or {}))
+        return RouterCompressionResult(
+            compressed="kept words",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{index}" for index in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "reused_call_id",
+                "output": long_text,
+            }
+        ],
+    }
+
+    handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id="independent_request_one",
+    )
+    handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id="independent_request_two",
+    )
+
+    assert [(item["request_id"], item["session_id"]) for item in attributions] == [
+        ("independent_request_one", "independent_request_one"),
+        ("independent_request_two", "independent_request_two"),
+    ]
 
 
 def test_openai_responses_adapter_batches_small_array_parts_without_touching_images():
@@ -963,6 +1164,98 @@ def test_openai_responses_adapter_compresses_non_excluded_tool_outputs():
     assert units_by_category == {"applied": 1}
 
 
+def test_openai_responses_adapter_threads_tool_name_to_router():
+    """Known Responses call names survive provider-neutral unit extraction."""
+
+    router = ContentRouter()
+    seen_tool_names: list[str | None] = []
+
+    def compress(self, content: str, **kwargs):
+        seen_tool_names.append(kwargs.get("tool_name"))
+        return RouterCompressionResult(
+            compressed="compressed tool output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    output = " ".join(f"word{i}" for i in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "catalog_reader",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": output,
+            },
+        ],
+    }
+
+    new_payload, modified, *_ = handler._compress_openai_responses_live_text_units_with_router(
+        payload,
+        model="gpt-5",
+        request_id="req_tool_name",
+    )
+
+    assert modified is True
+    assert new_payload["input"][1]["output"] == "compressed tool output"
+    assert seen_tool_names == ["catalog_reader"]
+
+
+def test_retrieval_aware_unit_cache_publishes_only_after_transaction_commit():
+    from headroom.transforms.content_router import (
+        PolicySideEffectTransaction,
+        activate_policy_side_effect_transaction,
+    )
+
+    router = ContentRouter()
+    router.config.retrieval_aware_enabled = True
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        return RouterCompressionResult(
+            compressed="transaction-scoped summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{index}" for index in range(180))
+    payload = {
+        "model": "gpt-5",
+        "input": [{"type": "function_call_output", "call_id": "call-a", "output": long_text}],
+    }
+
+    discarded = PolicySideEffectTransaction()
+    with activate_policy_side_effect_transaction(discarded):
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="request-cache-transaction"
+        )
+    discarded.discard()
+
+    committed = PolicySideEffectTransaction()
+    with activate_policy_side_effect_transaction(committed):
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="request-cache-transaction"
+        )
+    committed.commit()
+
+    handler._compress_openai_responses_live_text_units_with_router(
+        payload, model="gpt-5", request_id="request-cache-transaction"
+    )
+
+    assert calls["count"] == 2
+
+
 def test_openai_responses_adapter_keeps_small_and_opaque_items():
     router = ContentRouter()
 
@@ -1153,3 +1446,191 @@ def test_openai_responses_adapter_floors_when_aggregate_below_threshold():
     assert saved == 0
     assert units_by_category == {"size_floor": len(outputs)}
     assert new_payload == payload
+
+
+def test_openai_responses_stateful_continuation_recovers_tool_name_and_attribution():
+    router = ContentRouter()
+    seen: list[tuple[str | None, dict[str, str] | None]] = []
+
+    def compress(self, content: str, *, attribution=None, **kwargs):
+        seen.append((kwargs.get("tool_name"), attribution))
+        return RouterCompressionResult(
+            compressed="compressed stateful output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    first_output = " ".join(f"first{i}" for i in range(180))
+    second_output = " ".join(f"second{i}" for i in range(180))
+    first = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "stateful_call",
+                "name": "catalog_reader",
+                "arguments": '{"path":"catalog.json"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "stateful_call",
+                "output": first_output,
+            },
+        ],
+    }
+    continuation = {
+        "model": "gpt-5",
+        "previous_response_id": "resp_parent",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "stateful_call",
+                "output": second_output,
+            }
+        ],
+    }
+
+    handler._compress_openai_responses_live_text_units_with_router(
+        first, model="gpt-5", request_id="request-first"
+    )
+    handler._compress_openai_responses_live_text_units_with_router(
+        continuation, model="gpt-5", request_id="request-second"
+    )
+
+    assert [name for name, _ in seen] == ["catalog_reader", "catalog_reader"]
+    second_attribution = seen[1][1]
+    assert second_attribution is not None
+    assert second_attribution["tool_call_id"] == "stateful_call"
+    assert second_attribution["request_id"] == "request-second"
+    assert second_attribution["session_id"] == "resp_parent"
+    assert "catalog.json" in second_attribution["tool_context"]
+
+
+def test_openai_responses_correlation_is_scoped_and_ambiguous_fallback_fails_closed():
+    router = ContentRouter()
+    seen: list[tuple[str | None, dict[str, str] | None]] = []
+
+    def compress(self, content: str, *, attribution=None, **kwargs):
+        seen.append((kwargs.get("tool_name"), attribution))
+        return RouterCompressionResult(
+            compressed="compressed correlated output",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    for conversation_id, tool_name in (("conv-a", "catalog_a"), ("conv-b", "catalog_b")):
+        handler._compress_openai_responses_live_text_units_with_router(
+            {
+                "model": "gpt-5",
+                "conversation": {"id": conversation_id},
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "reused_call",
+                        "name": tool_name,
+                        "arguments": json.dumps({"source": conversation_id}),
+                    }
+                ],
+            },
+            model="gpt-5",
+            request_id=f"seed-{conversation_id}",
+        )
+
+    output = " ".join(f"item{i}" for i in range(180))
+    handler._compress_openai_responses_live_text_units_with_router(
+        {
+            "model": "gpt-5",
+            "conversation": {"id": "conv-a"},
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "reused_call",
+                    "output": output,
+                }
+            ],
+        },
+        model="gpt-5",
+        request_id="exact-scope",
+    )
+    handler._compress_openai_responses_live_text_units_with_router(
+        {
+            "model": "gpt-5",
+            "conversation": {"id": "conv-unrelated"},
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "reused_call",
+                    "output": output,
+                }
+            ],
+        },
+        model="gpt-5",
+        request_id="ambiguous-scope",
+    )
+
+    assert [name for name, _attribution in seen] == ["catalog_a", None]
+    exact_attribution = seen[0][1]
+    assert exact_attribution is not None
+    assert exact_attribution["session_id"] == "conv-a"
+    assert "conv-a" in exact_attribution["tool_context"]
+    ambiguous_attribution = seen[1][1]
+    assert ambiguous_attribution is not None
+    assert ambiguous_attribution["tool_name"] == ""
+    assert ambiguous_attribution["tool_context"] == ""
+
+
+def test_stateful_headroom_retrieval_output_is_protected_from_recompression():
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs):
+        raise AssertionError("headroom recovery output must not be recompressed")
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    conversation = {"id": "conv-recovery"}
+    handler._compress_openai_responses_live_text_units_with_router(
+        {
+            "model": "gpt-5",
+            "conversation": conversation,
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "retrieve-call",
+                    "name": "headroom_retrieve",
+                    "arguments": '{"hash":"abcdef123456"}',
+                }
+            ],
+        },
+        model="gpt-5",
+        request_id="seed-recovery",
+    )
+    payload = {
+        "model": "gpt-5",
+        "conversation": conversation,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "retrieve-call",
+                "output": "recovered original content " * 180,
+            }
+        ],
+    }
+
+    updated, modified, saved, _transforms, categories, _chain, attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="recovery-output",
+        )
+    )
+
+    assert updated == payload
+    assert modified is False
+    assert saved == 0
+    assert categories == {}
+    assert attempted == 0

@@ -23,7 +23,7 @@ from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
 from .base import Transform
 from .cache_aligner import CacheAligner
-from .content_router import ContentRouter
+from .content_router import ContentRouter, defer_policy_side_effect_until_commit
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
@@ -522,15 +522,22 @@ class TransformPipeline:
                 pipeline_span.set_attribute("headroom.warnings", len(all_warnings))
 
             if record_metrics:
-                get_otel_metrics().record_pipeline_run(
-                    model=model,
-                    provider=provider_name,
-                    tokens_before=tokens_before,
-                    tokens_after=tokens_after,
-                    duration_ms=pipeline_ms,
-                    timing=all_timing,
-                    transforms_applied=all_transforms,
-                    waste_signals=waste_signals.to_dict() if waste_signals is not None else None,
+                timing_snapshot = dict(all_timing)
+                transforms_snapshot = list(all_transforms)
+                waste_snapshot = waste_signals.to_dict() if waste_signals is not None else None
+
+                defer_policy_side_effect_until_commit(
+                    lambda: get_otel_metrics().record_pipeline_run(
+                        model=model,
+                        provider=provider_name,
+                        tokens_before=tokens_before,
+                        tokens_after=tokens_after,
+                        duration_ms=pipeline_ms,
+                        timing=timing_snapshot,
+                        transforms_applied=transforms_snapshot,
+                        waste_signals=waste_snapshot,
+                    ),
+                    label="retrieval-aware-pipeline-metrics",
                 )
 
         return TransformResult(

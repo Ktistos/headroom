@@ -29,6 +29,7 @@ leaked-thread counter is how we make that visible.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import threading
 import time
 
@@ -454,3 +455,172 @@ def test_explicit_None_resolves_to_auto_source() -> None:
     with TestClient(app) as client:
         r = client.get("/health")
         assert r.json()["runtime"]["compression_executor"]["source"] == "auto"
+
+
+def test_timeout_discards_effects_registered_by_late_executor_worker() -> None:
+    from headroom.transforms.content_router import _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION
+
+    proxy = _make_proxy(compression_max_workers=1)
+    finished = threading.Event()
+    state = {"discarded": 0, "committed": 0}
+
+    def _late_compression():
+        time.sleep(0.08)
+        transaction = _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION.get()
+        assert transaction is not None
+        transaction.register(
+            "late-provider-event",
+            commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+            discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+        )
+        finished.set()
+        return "late"
+
+    async def _drive():
+        with pytest.raises(asyncio.TimeoutError):
+            await proxy._run_compression_in_executor(_late_compression, timeout=0.01)
+
+    asyncio.run(_drive())
+    assert finished.wait(timeout=1.0)
+    assert state == {"discarded": 1, "committed": 0}
+
+
+def test_compression_executor_propagates_request_context() -> None:
+    proxy = _make_proxy(compression_max_workers=1)
+    request_scope = contextvars.ContextVar("test_request_scope", default="missing")
+
+    async def _drive():
+        token = request_scope.set("request-store")
+        try:
+            return await proxy._run_compression_in_executor(request_scope.get, timeout=1.0)
+        finally:
+            request_scope.reset(token)
+
+    assert asyncio.run(_drive()) == "request-store"
+
+
+def test_async_cancellation_discards_late_executor_effects() -> None:
+    from headroom.transforms.content_router import _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION
+
+    proxy = _make_proxy(compression_max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    state = {"discarded": 0, "committed": 0}
+
+    def _compression():
+        started.set()
+        release.wait(timeout=1.0)
+        transaction = _ACTIVE_POLICY_SIDE_EFFECT_TRANSACTION.get()
+        assert transaction is not None
+        transaction.register(
+            "cancelled-provider-event",
+            commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+            discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+        )
+        finished.set()
+        return "late"
+
+    async def _drive():
+        task = asyncio.create_task(proxy._run_compression_in_executor(_compression, timeout=10.0))
+        while not started.is_set():
+            await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_drive())
+    release.set()
+    assert finished.wait(timeout=1.0)
+    assert state == {"discarded": 1, "committed": 0}
+
+
+@pytest.mark.parametrize("adopted", [True, False])
+def test_executor_effects_wait_for_request_provider_adoption(adopted: bool) -> None:
+    from headroom.transforms.content_router import (
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+        current_policy_side_effect_transaction,
+        finalize_request_policy_side_effects,
+    )
+
+    proxy = _make_proxy(compression_max_workers=1)
+    holder = RequestPolicySideEffectHolder()
+    state = {"committed": 0, "discarded": 0}
+
+    def _compression():
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        transaction.register(
+            "provider-adoption",
+            commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+            discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+        )
+        return "compressed"
+
+    async def _drive():
+        with activate_request_policy_side_effect_holder(holder):
+            result = await proxy._run_compression_in_executor(
+                _compression,
+                timeout=1.0,
+            )
+            assert state == {"committed": 0, "discarded": 0}
+            finalize_request_policy_side_effects(commit=adopted)
+            return result
+
+    assert asyncio.run(_drive()) == "compressed"
+    assert state == {
+        "committed": int(adopted),
+        "discarded": int(not adopted),
+    }
+
+
+def test_http_request_transaction_uses_endpoint_status_as_adoption_boundary(monkeypatch) -> None:
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+
+    from headroom.transforms.content_router import current_policy_side_effect_transaction
+
+    monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "control")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    state = {"committed": 0, "discarded": 0}
+
+    @app.get("/test-policy-adoption/{status_code}")
+    async def _policy_adoption(status_code: int):
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        transaction.register(
+            f"http-status-{status_code}",
+            commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+            discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+        )
+        return JSONResponse({"status": status_code}, status_code=status_code)
+
+    registered_route = app.router.routes.pop()
+    catch_all_index = next(
+        index
+        for index, route in enumerate(app.router.routes)
+        if getattr(route, "path", "") == "/{path:path}"
+    )
+    app.router.routes.insert(catch_all_index, registered_route)
+    with TestClient(app) as client:
+        accepted = client.get("/test-policy-adoption/200")
+        rejected = client.get("/test-policy-adoption/502")
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 502
+    assert state == {
+        "committed": 1,
+        "discarded": 1,
+    }

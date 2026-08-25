@@ -704,6 +704,85 @@ class TestCompressContextLimitByModelFamily:
         assert openai_calls == []
 
 
+class TestCompressRetrievalAwareLifecycle:
+    """The standalone CCR mode still needs request-scoped attribution."""
+
+    def test_ccr_mode_uses_fresh_request_scope(self, client, monkeypatch):
+        proxy = client.app.state.proxy
+        seen: list[dict] = []
+
+        def fake_apply(**kwargs):
+            seen.append(kwargs)
+            return SimpleNamespace(
+                messages=kwargs["messages"],
+                tokens_before=10,
+                tokens_after=9,
+                transforms_applied=[],
+                transforms_summary={},
+                markers_inserted=[],
+            )
+
+        monkeypatch.setattr(proxy._ccr_pipeline(), "apply", fake_apply)
+        body = {
+            "messages": [{"role": "tool", "tool_call_id": "call-1", "content": "data"}],
+            "model": "gpt-4o",
+            "config": {"mode": "ccr"},
+        }
+
+        assert client.post("/v1/compress", json=body).status_code == 200
+        assert client.post("/v1/compress", json=body).status_code == 200
+
+        assert len(seen) == 2
+        assert seen[0]["request_id"] == seen[0]["session_id"]
+        assert seen[1]["request_id"] == seen[1]["session_id"]
+        assert seen[0]["request_id"] != seen[1]["request_id"]
+        assert seen[0]["recovery_payload_path"] == "unknown"
+        assert seen[1]["recovery_payload_path"] == "unknown"
+
+    def test_provider_token_inflation_discards_request_effects(self, client, monkeypatch):
+        from headroom.transforms.content_router import current_policy_side_effect_transaction
+
+        monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "control")
+        proxy = client.app.state.proxy
+        committed: list[str] = []
+        discarded: list[str] = []
+        original = [{"role": "tool", "tool_call_id": "call-1", "content": "data"}]
+
+        def fake_apply(**kwargs):
+            transaction = current_policy_side_effect_transaction()
+            assert transaction is not None
+            transaction.register(
+                "event-1",
+                commit=lambda: committed.append("event-1"),
+                discard=lambda: discarded.append("event-1"),
+            )
+            return SimpleNamespace(
+                messages=[{"role": "tool", "content": "larger transformed data"}],
+                tokens_before=10,
+                tokens_after=11,
+                transforms_applied=["smart_crusher"],
+                transforms_summary={"smart_crusher": 1},
+                markers_inserted=["hash-1"],
+            )
+
+        monkeypatch.setattr(proxy._ccr_pipeline(), "apply", fake_apply)
+
+        response = client.post(
+            "/v1/compress",
+            json={"messages": original, "model": "gpt-4o", "config": {"mode": "ccr"}},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["messages"] == original
+        assert data["tokens_before"] == data["tokens_after"] == 10
+        assert data["tokens_saved"] == 0
+        assert data["transforms_applied"] == []
+        assert data["ccr_hashes"] == []
+        assert committed == []
+        assert discarded == ["event-1"]
+
+
 class TestCompressEndpointDoesNotBlockLoop:
     """/v1/compress must offload to the compression executor so a slow/large
     payload cannot freeze the single event loop (#718)."""

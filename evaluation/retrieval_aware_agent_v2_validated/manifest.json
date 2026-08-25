@@ -1,0 +1,168 @@
+{
+  "accounting_corrections": [
+    {
+      "expected_model_visible_mcp_tokens": 7269,
+      "output_run_index": 1,
+      "recorded_logical_payload_tokens": 5434,
+      "source_trace": "evaluation/retrieval_aware_agent_v2_high_reveal/RECOVERY_RUN_01_CODEX_TRACE.txt"
+    },
+    {
+      "expected_model_visible_mcp_tokens": 7270,
+      "output_run_index": 4,
+      "recorded_logical_payload_tokens": 5434,
+      "source_trace": "evaluation/retrieval_aware_agent_v2_high_reveal_retry/RECOVERY_RUN_01_CODEX_TRACE.txt"
+    }
+  ],
+  "attempts": [
+    {
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+      "source_run_indexes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    {
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal_retry/results.json",
+      "source_run_indexes": [
+        1,
+        2,
+        3
+      ]
+    },
+    {
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_indexes": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    }
+  ],
+  "excluded": {
+    "invalid": [
+      {
+        "classification": "contaminated",
+        "evidence": "evaluation/retrieval_aware_agent_v2_high_reveal/INVALID_RUN_06_TRACE.md",
+        "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+        "source_run_index": 6
+      }
+    ],
+    "superseded_valid": [
+      {
+        "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+        "source_run_index": 4
+      },
+      {
+        "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+        "source_run_index": 5
+      }
+    ]
+  },
+  "expected_counts": {
+    "attempted": 18,
+    "included": 15,
+    "invalid": 1,
+    "superseded_valid": 2,
+    "valid": 17
+  },
+  "output": {
+    "codex_version": "codex-cli 0.147.0",
+    "conditions": [
+      "historical_lossy",
+      "always_lossless",
+      "retrieval_aware"
+    ],
+    "model": "gpt-5.4",
+    "reasoning_effort": "low",
+    "schema_version": 2,
+    "seed_mode": "fresh_random"
+  },
+  "schema_version": 1,
+  "source_rows": [
+    {
+      "output_run_index": 1,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+      "source_run_index": 1
+    },
+    {
+      "output_run_index": 2,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+      "source_run_index": 2
+    },
+    {
+      "output_run_index": 3,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal/results.json",
+      "source_run_index": 3
+    },
+    {
+      "output_run_index": 4,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal_retry/results.json",
+      "source_run_index": 1
+    },
+    {
+      "output_run_index": 5,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal_retry/results.json",
+      "source_run_index": 2
+    },
+    {
+      "output_run_index": 6,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2_high_reveal_retry/results.json",
+      "source_run_index": 3
+    },
+    {
+      "output_run_index": 7,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 7
+    },
+    {
+      "output_run_index": 8,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 8
+    },
+    {
+      "output_run_index": 9,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 9
+    },
+    {
+      "output_run_index": 10,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 10
+    },
+    {
+      "output_run_index": 11,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 11
+    },
+    {
+      "output_run_index": 12,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 12
+    },
+    {
+      "output_run_index": 13,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 13
+    },
+    {
+      "output_run_index": 14,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 14
+    },
+    {
+      "output_run_index": 15,
+      "source_artifact": "evaluation/retrieval_aware_agent_v2/results.json",
+      "source_run_index": 15
+    }
+  ]
+}

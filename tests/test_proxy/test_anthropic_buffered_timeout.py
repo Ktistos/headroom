@@ -343,6 +343,53 @@ def test_anthropic_ccr_continuation_uses_buffered_timeout() -> None:
     assert isinstance(http_client.calls[0]["timeout"], httpx.Timeout)
 
 
+def test_anthropic_ccr_continuation_rejects_non_success_status() -> None:
+    config = _make_config()
+    config.ccr_inject_tool = True
+    config.ccr_handle_responses = True
+    app = create_app(config)
+
+    class _CCRHandler:
+        def has_ccr_tool_calls(self, response, provider):  # noqa: ANN001
+            return True
+
+        async def handle_response(  # noqa: ANN001
+            self,
+            response,
+            optimized_messages,
+            tools,
+            api_call_fn,
+            provider,
+        ):
+            return await api_call_fn(optimized_messages, tools)
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        _install_prefix_tracker(proxy)
+        proxy.ccr_response_handler = _CCRHandler()
+        proxy.http_client = _BufferedPassthroughClient(httpx.Response(503, json={"error": "busy"}))
+
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+            return httpx.Response(200, json=_anthropic_message_response())
+
+        proxy._retry_request = _fake_retry  # type: ignore[assignment]
+        response = client.post(
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+    assert response.status_code == 502
+
+
 def test_anthropic_memory_continuation_uses_buffered_timeout() -> None:
     config = _make_config()
     config.memory_enabled = True

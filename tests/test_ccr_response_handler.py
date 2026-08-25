@@ -746,3 +746,294 @@ class TestExtractAssistantMessageEdgeCases:
         resp = {"choices": [{"message": {"content": "hi", "tool_calls": [{"id": "1"}]}}]}
         msg = handler._extract_assistant_message(resp, "openai")
         assert msg == {"role": "assistant", "content": "hi", "tool_calls": [{"id": "1"}]}
+
+
+@pytest.mark.asyncio
+async def test_automatic_response_handler_charges_only_dispatched_provider_payload():
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        estimate_payload_tokens,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    hash_key = "a1b2c3d4e5f6"
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=500,
+        initially_emitted_tokens=100,
+        ccr_hashes=[hash_key],
+    )
+    get_compression_store().store(
+        original='[{"id":1,"exact":"payload"}]',
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+    )
+    handler = CCRResponseHandler()
+    initial = {
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_auto",
+                "name": CCR_TOOL_NAME,
+                "input": {"hash": hash_key},
+            }
+        ]
+    }
+    dispatched = []
+
+    async def api_call(messages, tools):
+        dispatched.extend(messages)
+        assert ledger.snapshot()["recovery_payload_tokens"] == 0
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    await handler.handle_response(initial, [], None, api_call, "anthropic")
+    expected_payload = dispatched[-1]
+    expected_tokens = estimate_payload_tokens(expected_payload)
+    assert ledger.snapshot()["recovery_payload_tokens"] == expected_tokens
+    stored_entry = get_compression_store().retrieve_for_internal_use(hash_key)
+    assert stored_entry is not None
+    assert stored_entry.retrieval_count == 1
+
+    # Replaying the same provider tool call is one logical recovery: neither
+    # payload accounting nor retrieval learning may be applied twice.
+    await handler.handle_response(initial, [], None, api_call, "anthropic")
+    assert ledger.snapshot()["recovery_payload_tokens"] == expected_tokens
+    stored_entry = get_compression_store().retrieve_for_internal_use(hash_key)
+    assert stored_entry is not None
+    assert stored_entry.retrieval_count == 1
+    enable_compression_cost_tracking(False)
+    ledger.clear()
+    reset_compression_store()
+
+
+@pytest.mark.asyncio
+async def test_automatic_response_handler_deduplicates_feedback_when_tracking_disabled():
+    from headroom.transforms.retrieval_aware_policy import (
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(False)
+    hash_key = "aabbccddeeff"
+    get_compression_store().store(
+        original="legacy payload",
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+    )
+    initial = {
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_legacy_retry",
+                "name": CCR_TOOL_NAME,
+                "input": {"hash": hash_key},
+            }
+        ]
+    }
+
+    async def api_call(_messages, _tools):
+        return {"content": [{"type": "text", "text": "done"}]}
+
+    handler = CCRResponseHandler()
+    await handler.handle_response(initial, [], None, api_call, "anthropic")
+    await handler.handle_response(initial, [], None, api_call, "anthropic")
+
+    entry = get_compression_store().retrieve_for_internal_use(hash_key)
+    assert entry is not None
+    assert entry.retrieval_count == 1
+    ledger.clear()
+    reset_compression_store()
+
+
+@pytest.mark.asyncio
+async def test_failed_continuation_does_not_charge_model_recovery():
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    hash_key = "f1e2d3c4b5a6"
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=500,
+        initially_emitted_tokens=100,
+        ccr_hashes=[hash_key],
+    )
+    get_compression_store().store(
+        original="payload",
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+    )
+    initial = {
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tool_failed",
+                "name": CCR_TOOL_NAME,
+                "input": {"hash": hash_key},
+            }
+        ]
+    }
+
+    async def api_call(messages, tools):
+        raise RuntimeError("provider rejected request")
+
+    await CCRResponseHandler().handle_response(initial, [], None, api_call, "anthropic")
+    assert ledger.snapshot()["recovery_payload_tokens"] == 0
+    stored_entry = get_compression_store().retrieve_for_internal_use(hash_key)
+    assert stored_entry is not None
+    assert stored_entry.retrieval_count == 0
+    enable_compression_cost_tracking(False)
+    ledger.clear()
+    reset_compression_store()
+
+
+@pytest.mark.asyncio
+async def test_continuation_error_sentinel_does_not_charge_model_recovery():
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    hash_key = "f0e1d2c3b4a5"
+    event_id = ledger.record_outcome(
+        tool_name="catalog_reader",
+        strategy="row_drop",
+        action=CompressionAction.LOSSY,
+        predicted_action=CompressionAction.LOSSY,
+        original_tokens=500,
+        initially_emitted_tokens=100,
+        ccr_hashes=[hash_key],
+    )
+    get_compression_store().store(
+        original="payload",
+        compressed=f"<<ccr:{hash_key}>>",
+        explicit_hash=hash_key,
+        compression_event_id=event_id,
+    )
+    initial = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": CCR_TOOL_NAME,
+                                "id": "tool_failed",
+                                "args": {"hash": hash_key},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    sentinel = {
+        "_headroom_continuation_error": {
+            "status_code": 503,
+            "content": b"busy",
+            "headers": {"retry-after": "2"},
+        }
+    }
+
+    async def api_call(_messages, _tools):
+        return sentinel
+
+    result = await CCRResponseHandler().handle_response(initial, [], None, api_call, "google")
+    assert result == sentinel
+    assert ledger.snapshot()["recovery_payload_tokens"] == 0
+    stored_entry = get_compression_store().retrieve_for_internal_use(hash_key)
+    assert stored_entry is not None
+    assert stored_entry.retrieval_count == 0
+    enable_compression_cost_tracking(False)
+    ledger.clear()
+    reset_compression_store()
+
+
+def test_generic_multi_result_payload_accounts_every_recovered_event_once():
+    from headroom.transforms.retrieval_aware_policy import (
+        CompressionAction,
+        enable_compression_cost_tracking,
+        estimate_payload_tokens,
+        get_compression_cost_ledger,
+    )
+
+    reset_compression_store()
+    ledger = get_compression_cost_ledger()
+    ledger.clear()
+    enable_compression_cost_tracking(True)
+    try:
+        store = get_compression_store()
+        results = []
+        event_ids = []
+        for index in range(2):
+            hash_key = f"{index + 10:012x}"
+            event_id = ledger.record_outcome(
+                tool_name="generic_reader",
+                strategy="row_drop",
+                action=CompressionAction.LOSSY,
+                predicted_action=CompressionAction.LOSSY,
+                original_tokens=500,
+                initially_emitted_tokens=100,
+                ccr_hashes=[hash_key],
+            )
+            store.store(
+                original=f"generic payload {index}",
+                compressed=f"<<ccr:{hash_key}>>",
+                explicit_hash=hash_key,
+                compression_event_id=event_id,
+            )
+            entry = store.retrieve_for_internal_use(hash_key)
+            assert entry is not None
+            results.append(
+                CCRToolResult(
+                    tool_call_id=f"generic-call-{index}",
+                    content=json.dumps({"payload": index}),
+                    success=True,
+                    hash_key=hash_key,
+                    retrieval_event_id=f"generic-retrieval-{index}",
+                    compression_entry=entry,
+                )
+            )
+            event_ids.append(event_id)
+
+        handler = CCRResponseHandler()
+        payload = handler._create_tool_result_message(results, "generic")
+        handler._account_created_tool_result(results, "generic", payload)
+
+        snapshot = ledger.snapshot()
+        assert snapshot["actual_recovery_events"] == 2
+        assert snapshot["recovery_payload_tokens"] == estimate_payload_tokens(payload)
+        recent = {row["compression_event_id"]: row for row in snapshot["recent"]}
+        assert all(recent[event_id]["retrieval_count"] == 1 for event_id in event_ids)
+        assert all(recent[event_id]["recovery_payload_tokens"] > 0 for event_id in event_ids)
+    finally:
+        enable_compression_cost_tracking(False)
+        ledger.clear()
+        reset_compression_store()

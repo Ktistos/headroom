@@ -50,6 +50,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_SECONDS
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
+MAX_ATTRIBUTION_CANDIDATES = 32
+
+_ATTRIBUTION_FIELDS = (
+    "compression_event_id",
+    "retrieval_handle",
+    "session_id",
+    "request_id",
+    "tool_call_id",
+    "provider_slot",
+    "tool_name",
+    "compression_strategy",
+    "tool_signature_hash",
+    "attribution_kind",
+)
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
 # Previews carry verbatim tool-result content (post-redaction), which makes
@@ -166,7 +180,18 @@ class CompressionEntry:
     tool_call_id: str | None
     query_context: str | None
     created_at: float
+    session_id: str | None = None
+    request_id: str | None = None
+    compression_event_id: str | None = None
+    retrieval_handle: str | None = None
+    provider_slot: str | None = None
+    attribution_kind: str | None = None
     ttl: int = DEFAULT_CCR_TTL_SECONDS
+
+    # One content-derived hash can be emitted by multiple compression events.
+    # Persist their attribution so duplicate stores cannot silently redirect a
+    # later recovery report to whichever event happened to write last.
+    attribution_candidates: list[dict[str, str]] = field(default_factory=list)
 
     # TOIN integration: Store the tool signature hash for retrieval correlation
     # This MUST match the hash used by SmartCrusher when recording compression
@@ -191,6 +216,198 @@ class CompressionEntry:
             # Keep only last 10 queries
             if len(self.search_queries) > 10:
                 self.search_queries = self.search_queries[-10:]
+
+
+def _entry_attribution_candidate(entry: CompressionEntry) -> dict[str, str]:
+    return {
+        field_name: str(getattr(entry, field_name, "") or "") for field_name in _ATTRIBUTION_FIELDS
+    }
+
+
+def _normalize_attribution_candidate(candidate: Any) -> dict[str, str]:
+    if not isinstance(candidate, dict):
+        return {}
+    normalized = {
+        field_name: str(candidate.get(field_name, "") or "") for field_name in _ATTRIBUTION_FIELDS
+    }
+    return normalized if any(normalized.values()) else {}
+
+
+def _legacy_unattributed_candidate() -> dict[str, str]:
+    candidate = dict.fromkeys(_ATTRIBUTION_FIELDS, "")
+    candidate["attribution_kind"] = "legacy_unattributed"
+    return candidate
+
+
+def _candidate_identity(candidate: dict[str, str]) -> tuple[str, ...]:
+    event_id = candidate.get("compression_event_id", "")
+    if event_id:
+        return ("event", event_id)
+    return ("metadata", *(candidate.get(field_name, "") for field_name in _ATTRIBUTION_FIELDS))
+
+
+def _attribution_candidates(entry: CompressionEntry) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    seen: set[tuple[str, ...]] = set()
+    raw_candidates = getattr(entry, "attribution_candidates", None) or []
+    for raw_candidate in [*raw_candidates, _entry_attribution_candidate(entry)]:
+        candidate = _normalize_attribution_candidate(raw_candidate)
+        if not candidate:
+            continue
+        identity = _candidate_identity(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidates.append(candidate)
+    return candidates[-MAX_ATTRIBUTION_CANDIDATES:]
+
+
+def resolve_entry_attribution(
+    entry: CompressionEntry,
+    *,
+    compression_event_id: str | None = None,
+    retrieval_handle: str | None = None,
+    session_id: str | None = None,
+    request_id: str | None = None,
+    tool_call_id: str | None = None,
+    provider_slot: str | None = None,
+) -> dict[str, str]:
+    """Resolve one persisted attribution candidate or return blank metadata.
+
+    Hash-only retrieval cannot distinguish two compression events that emitted
+    identical content. Blank fields let the ledger reject that ambiguity
+    explicitly instead of charging whichever event stored the hash last.
+    """
+
+    filters = {
+        "compression_event_id": str(compression_event_id or ""),
+        "retrieval_handle": str(retrieval_handle or ""),
+        "session_id": str(session_id or ""),
+        "request_id": str(request_id or ""),
+        "tool_call_id": str(tool_call_id or ""),
+        "provider_slot": str(provider_slot or ""),
+    }
+    candidates = _attribution_candidates(entry)
+    for field_name, expected in filters.items():
+        if expected:
+            candidates = [item for item in candidates if item.get(field_name) == expected]
+    if len(candidates) == 1:
+        return candidates[0]
+    return dict.fromkeys(_ATTRIBUTION_FIELDS, "")
+
+
+def _entry_attribution_resolution_status(
+    entry: CompressionEntry,
+    *,
+    compression_event_id: str | None = None,
+    retrieval_handle: str | None = None,
+    session_id: str | None = None,
+    request_id: str | None = None,
+    tool_call_id: str | None = None,
+    provider_slot: str | None = None,
+) -> str:
+    """Classify whether a retrieval reference identifies one producer.
+
+    Old entries without event attribution remain retrievable. Once attribution
+    candidates exist, however, content must not leave the store unless the
+    supplied selectors resolve exactly one candidate. In particular, returning
+    content for an ambiguous legacy hash would make model-visible recovery
+    impossible to charge to the correct compression event.
+    """
+    candidates = _attribution_candidates(entry)
+    if not candidates:
+        return "available"
+    filters = {
+        "compression_event_id": str(compression_event_id or ""),
+        "retrieval_handle": str(retrieval_handle or ""),
+        "session_id": str(session_id or ""),
+        "request_id": str(request_id or ""),
+        "tool_call_id": str(tool_call_id or ""),
+        "provider_slot": str(provider_slot or ""),
+    }
+    for field_name, expected in filters.items():
+        if expected:
+            candidates = [item for item in candidates if item.get(field_name) == expected]
+    if len(candidates) == 1:
+        return "available"
+    return "ambiguous" if len(candidates) > 1 else "unresolved"
+
+
+def _entry_with_resolved_attribution(
+    entry: CompressionEntry,
+    *,
+    compression_event_id: str | None = None,
+    retrieval_handle: str | None = None,
+    session_id: str | None = None,
+    request_id: str | None = None,
+    tool_call_id: str | None = None,
+    provider_slot: str | None = None,
+) -> CompressionEntry:
+    attribution = resolve_entry_attribution(
+        entry,
+        compression_event_id=compression_event_id,
+        retrieval_handle=retrieval_handle,
+        session_id=session_id,
+        request_id=request_id,
+        tool_call_id=tool_call_id,
+        provider_slot=provider_slot,
+    )
+    resolved_candidates = (
+        [dict(attribution)] if any(attribution.values()) else _attribution_candidates(entry)
+    )
+    return replace(
+        entry,
+        compression_event_id=attribution["compression_event_id"] or None,
+        retrieval_handle=attribution["retrieval_handle"] or None,
+        session_id=attribution["session_id"] or None,
+        request_id=attribution["request_id"] or None,
+        tool_call_id=attribution["tool_call_id"] or None,
+        provider_slot=attribution["provider_slot"] or None,
+        tool_name=attribution["tool_name"] or None,
+        compression_strategy=attribution["compression_strategy"] or None,
+        tool_signature_hash=attribution["tool_signature_hash"] or None,
+        attribution_kind=attribution["attribution_kind"] or None,
+        search_queries=list(entry.search_queries),
+        attribution_candidates=[dict(item) for item in resolved_candidates],
+    )
+
+
+def _entry_without_compression_event(
+    entry: CompressionEntry, compression_event_id: str
+) -> tuple[CompressionEntry | None, bool]:
+    """Remove one producer from a same-content entry.
+
+    Returns ``(replacement, changed)``. ``replacement`` is ``None`` when the
+    removed producer was the only reason the content existed.
+    """
+    candidates = _attribution_candidates(entry)
+    remaining = [
+        candidate
+        for candidate in candidates
+        if candidate.get("compression_event_id") != compression_event_id
+    ]
+    if len(remaining) == len(candidates):
+        return entry, False
+    if not remaining:
+        return None, True
+    attribution = remaining[-1]
+    return (
+        replace(
+            entry,
+            compression_event_id=attribution["compression_event_id"] or None,
+            retrieval_handle=attribution["retrieval_handle"] or None,
+            session_id=attribution["session_id"] or None,
+            request_id=attribution["request_id"] or None,
+            tool_call_id=attribution["tool_call_id"] or None,
+            provider_slot=attribution["provider_slot"] or None,
+            tool_name=attribution["tool_name"] or None,
+            compression_strategy=attribution["compression_strategy"] or None,
+            tool_signature_hash=attribution["tool_signature_hash"] or None,
+            attribution_kind=attribution["attribution_kind"] or None,
+            attribution_candidates=[dict(item) for item in remaining],
+        ),
+        True,
+    )
 
 
 @dataclass
@@ -254,6 +471,8 @@ class CompressionStore:
         self._retrieval_events: list[RetrievalEvent] = []
         self._max_events = 1000  # Keep last 1000 events
         self._pending_feedback_events: list[RetrievalEvent] = []
+        self._ambiguous_retrieval_attempts = 0
+        self._rejected_retrieval_references = 0
 
         # MEDIUM FIX #16: Use a min-heap for O(log n) eviction instead of O(n)
         # Heap entries are (created_at, hash_key) tuples
@@ -279,6 +498,11 @@ class CompressionStore:
         compressed_item_count: int = 0,
         tool_name: str | None = None,
         tool_call_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        provider_slot: str | None = None,
         query_context: str | None = None,
         tool_signature_hash: str | None = None,
         compression_strategy: str | None = None,
@@ -296,6 +520,11 @@ class CompressionStore:
             compressed_item_count: Number of items after compression.
             tool_name: Name of the tool that produced this output.
             tool_call_id: ID of the tool call.
+            session_id: Originating session, when available.
+            request_id: Originating provider/proxy request, when available.
+            compression_event_id: Unique adopted compression occurrence.
+            retrieval_handle: Opaque event-scoped marker selector.
+            provider_slot: Provider-owned message/block slot identifier.
             query_context: User query context for relevance matching.
             tool_signature_hash: Hash from ToolSignature for TOIN correlation.
             compression_strategy: Strategy used for compression.
@@ -382,6 +611,11 @@ class CompressionStore:
             compressed_item_count=compressed_item_count,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
+            session_id=session_id,
+            request_id=request_id,
+            compression_event_id=compression_event_id,
+            retrieval_handle=retrieval_handle,
+            provider_slot=provider_slot,
             query_context=query_context,
             created_at=time.time(),
             ttl=ttl if ttl is not None else self._default_ttl,
@@ -423,56 +657,176 @@ class CompressionStore:
                         "Duplicate store for hash=%s, updating entry",
                         hash_key,
                     )
+                    # SQLite performs this merge atomically under BEGIN
+                    # IMMEDIATE. Pre-merging its earlier read could resurrect a
+                    # candidate another worker discarded between get() and set().
+                    if not getattr(
+                        self._backend, "merges_attribution_candidates_atomically", False
+                    ):
+                        candidates = _attribution_candidates(existing)
+                        if not candidates:
+                            candidates = [_legacy_unattributed_candidate()]
+                        current_candidate = _entry_attribution_candidate(entry)
+                        if any(current_candidate.values()):
+                            current_identity = _candidate_identity(current_candidate)
+                            candidates = [
+                                item
+                                for item in candidates
+                                if _candidate_identity(item) != current_identity
+                            ]
+                            candidates.append(current_candidate)
+                        entry.attribution_candidates = candidates[-MAX_ATTRIBUTION_CANDIDATES:]
+                        if not any(current_candidate.values()) and candidates:
+                            preserved = candidates[-1]
+                            entry = replace(
+                                entry,
+                                compression_event_id=preserved["compression_event_id"] or None,
+                                retrieval_handle=preserved["retrieval_handle"] or None,
+                                session_id=preserved["session_id"] or None,
+                                request_id=preserved["request_id"] or None,
+                                tool_call_id=preserved["tool_call_id"] or None,
+                                provider_slot=preserved["provider_slot"] or None,
+                                tool_name=preserved["tool_name"] or None,
+                                compression_strategy=preserved["compression_strategy"] or None,
+                                tool_signature_hash=preserved["tool_signature_hash"] or None,
+                                attribution_kind=preserved["attribution_kind"] or None,
+                            )
                 # Mark old heap entry as stale since we're replacing it.
                 self._stale_heap_entries += 1
 
+            if not entry.attribution_candidates:
+                candidate = _entry_attribution_candidate(entry)
+                if any(candidate.values()):
+                    entry.attribution_candidates = [candidate]
             self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
 
         return hash_key
 
+    def discard_attribution_candidate(self, hash_key: str, *, compression_event_id: str) -> bool:
+        """Remove storage created for a policy event that never reached the wire."""
+        if not hash_key or not compression_event_id:
+            return False
+        atomic_discard = getattr(self._backend, "discard_attribution_candidate", None)
+        if callable(atomic_discard):
+            changed = bool(atomic_discard(hash_key, compression_event_id))
+            if changed and not self._backend.exists(hash_key):
+                with self._lock:
+                    self._stale_heap_entries += 1
+            return changed
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None:
+                return False
+            replacement, changed = _entry_without_compression_event(entry, compression_event_id)
+            if not changed:
+                return False
+            if replacement is None:
+                self._backend.delete(hash_key)
+                self._stale_heap_entries += 1
+            else:
+                self._backend.set(hash_key, replacement)
+            return True
+
     def retrieve(
         self,
         hash_key: str,
         query: str | None = None,
+        *,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        tool_call_id: str | None = None,
+        provider_slot: str | None = None,
     ) -> CompressionEntry | None:
         """Retrieve original content by hash.
 
         Args:
             hash_key: Hash key returned by store().
             query: Optional query for feedback tracking.
+            compression_event_id: Optional event-level attribution selector.
+            retrieval_handle: Optional opaque event-scoped selector.
+            session_id: Optional session-level attribution selector.
+            request_id: Optional request-level attribution selector.
+            tool_call_id: Optional originating tool-call selector.
 
         Returns:
             CompressionEntry if found and not expired, None otherwise.
         """
         with self._lock:
-            entry = self._backend.get(hash_key)
+            atomic_retrieve = getattr(self._backend, "retrieve_and_record_access", None)
+            if callable(atomic_retrieve):
+                resolution_status, resolved_entry = atomic_retrieve(
+                    hash_key,
+                    query,
+                    compression_event_id=compression_event_id,
+                    retrieval_handle=retrieval_handle,
+                    session_id=session_id,
+                    request_id=request_id,
+                    tool_call_id=tool_call_id,
+                    provider_slot=provider_slot,
+                )
+                if resolution_status != "available" or resolved_entry is None:
+                    if resolution_status == "expired":
+                        self._stale_heap_entries += 1
+                    if resolution_status in {"ambiguous", "unresolved"}:
+                        self._rejected_retrieval_references += 1
+                        if resolution_status == "ambiguous":
+                            self._ambiguous_retrieval_attempts += 1
+                    return None
+                entry = resolved_entry
+            else:
+                entry = self._backend.get(hash_key)
+                if entry is None:
+                    return None
+                if entry.is_expired():
+                    self._backend.delete(hash_key)
+                    self._stale_heap_entries += 1
+                    return None
 
-            if entry is None:
+                resolution_status = _entry_attribution_resolution_status(
+                    entry,
+                    compression_event_id=compression_event_id,
+                    retrieval_handle=retrieval_handle,
+                    session_id=session_id,
+                    request_id=request_id,
+                    tool_call_id=tool_call_id,
+                    provider_slot=provider_slot,
+                )
+                if resolution_status != "available":
+                    self._rejected_retrieval_references += 1
+                    if resolution_status == "ambiguous":
+                        self._ambiguous_retrieval_attempts += 1
+                    return None
+
+                entry.record_access(query)
+                self._backend.set(hash_key, entry)
+                resolved_entry = _entry_with_resolved_attribution(
+                    entry,
+                    compression_event_id=compression_event_id,
+                    retrieval_handle=retrieval_handle,
+                    session_id=session_id,
+                    request_id=request_id,
+                    tool_call_id=tool_call_id,
+                    provider_slot=provider_slot,
+                )
+
+            if retrieval_handle and resolved_entry.retrieval_handle != retrieval_handle:
                 return None
-
-            if entry.is_expired():
-                self._backend.delete(hash_key)
-                # CRITICAL FIX: Track stale heap entry
-                self._stale_heap_entries += 1
+            if compression_event_id and resolved_entry.compression_event_id != compression_event_id:
                 return None
-
-            # Track access for feedback
-            entry.record_access(query)
-            # Update the backend with the modified entry
-            self._backend.set(hash_key, entry)
-
-            # Log retrieval event
+            # Log retrieval feedback only against a uniquely resolved producer.
             if self._enable_feedback:
                 self._log_retrieval(
                     hash_key=hash_key,
                     query=query,
                     items_retrieved=entry.original_item_count,
                     total_items=entry.original_item_count,
-                    tool_name=entry.tool_name,
+                    tool_name=resolved_entry.tool_name,
                     retrieval_type="full",
-                    tool_signature_hash=entry.tool_signature_hash,
+                    tool_signature_hash=resolved_entry.tool_signature_hash,
                 )
             self._log_retrieval_payload(
                 hash_key=hash_key,
@@ -481,13 +835,11 @@ class CompressionStore:
                 payload=entry.original_content,
                 items_retrieved=entry.original_item_count,
                 total_items=entry.original_item_count,
-                entry=entry,
+                entry=resolved_entry,
             )
 
-            # CRITICAL: Make a deep copy to return
-            # (entry could be modified/evicted after lock release)
-            # The entry contains mutable fields (search_queries list) that must be copied
-            result_entry = replace(entry, search_queries=list(entry.search_queries))
+            # Return an independent copy with only unambiguous attribution.
+            result_entry = resolved_entry
 
         # Process feedback immediately to ensure TOIN learns in real-time
         if self._enable_feedback:
@@ -495,9 +847,167 @@ class CompressionStore:
 
         return result_entry
 
+    def retrieve_for_internal_use(
+        self,
+        hash_key: str,
+        *,
+        retrieval_handle: str | None = None,
+        compression_event_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        tool_call_id: str | None = None,
+        provider_slot: str | None = None,
+    ) -> CompressionEntry | None:
+        """Read an entry without claiming that its payload reached a model."""
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None:
+                return None
+            if entry.is_expired():
+                self._backend.delete(hash_key)
+                self._stale_heap_entries += 1
+                return None
+            resolution_status = _entry_attribution_resolution_status(
+                entry,
+                compression_event_id=compression_event_id,
+                retrieval_handle=retrieval_handle,
+                session_id=session_id,
+                request_id=request_id,
+                tool_call_id=tool_call_id,
+                provider_slot=provider_slot,
+            )
+            if resolution_status != "available":
+                self._rejected_retrieval_references += 1
+                if resolution_status == "ambiguous":
+                    self._ambiguous_retrieval_attempts += 1
+                return None
+            result_entry = _entry_with_resolved_attribution(
+                entry,
+                retrieval_handle=retrieval_handle,
+                compression_event_id=compression_event_id,
+                session_id=session_id,
+                request_id=request_id,
+                tool_call_id=tool_call_id,
+                provider_slot=provider_slot,
+            )
+            if retrieval_handle and result_entry.retrieval_handle != retrieval_handle:
+                return None
+            if compression_event_id and result_entry.compression_event_id != compression_event_id:
+                return None
+        try:
+            from ..transforms.retrieval_aware_policy import (
+                compression_cost_tracking_enabled,
+                get_compression_cost_ledger,
+            )
+
+            if compression_cost_tracking_enabled():
+                get_compression_cost_ledger().record_internal_store_access()
+        except Exception:
+            logger.debug("Internal store-access accounting failed", exc_info=True)
+        return result_entry
+
+    def get_retrieval_reference_status(
+        self,
+        hash_key: str,
+        *,
+        retrieval_handle: str | None = None,
+        compression_event_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        tool_call_id: str | None = None,
+        provider_slot: str | None = None,
+    ) -> dict[str, Any]:
+        """Describe reference resolution without returning or charging content."""
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None:
+                return {"hash": hash_key, "status": "missing", "candidate_count": 0}
+            if entry.is_expired():
+                return {
+                    "hash": hash_key,
+                    "status": "expired",
+                    "candidate_count": len(_attribution_candidates(entry)),
+                    "ttl_seconds": entry.ttl,
+                }
+            return {
+                "hash": hash_key,
+                "status": _entry_attribution_resolution_status(
+                    entry,
+                    compression_event_id=compression_event_id,
+                    retrieval_handle=retrieval_handle,
+                    session_id=session_id,
+                    request_id=request_id,
+                    tool_call_id=tool_call_id,
+                    provider_slot=provider_slot,
+                ),
+                "candidate_count": len(_attribution_candidates(entry)),
+                "ttl_seconds": entry.ttl,
+            }
+
+    def observe_retrieval_call(
+        self,
+        hash_key: str,
+        query: str | None = None,
+        *,
+        retrieval_handle: str | None = None,
+    ) -> bool:
+        """Record a model-generated retrieval call without returning payload.
+
+        Legacy mode preserves the existing feedback/TOIN signal. With
+        retrieval-aware tracking enabled the observation is diagnostic only:
+        it does not train feedback, increment ``CompressionEntry.retrieval_count``,
+        or enter payload accounting. A later model-injected recovery is the
+        only learning and charging boundary.
+        """
+        retrieval_aware_tracking = False
+        try:
+            from ..transforms.retrieval_aware_policy import (
+                compression_cost_tracking_enabled,
+                get_compression_cost_ledger,
+            )
+
+            retrieval_aware_tracking = compression_cost_tracking_enabled()
+        except Exception:
+            logger.debug("Retrieval-call observation accounting failed", exc_info=True)
+
+        with self._lock:
+            entry = self._backend.get(hash_key)
+            if entry is None or entry.is_expired():
+                return False
+            resolution_status = _entry_attribution_resolution_status(
+                entry, retrieval_handle=retrieval_handle
+            )
+            if resolution_status != "available":
+                self._rejected_retrieval_references += 1
+                if resolution_status == "ambiguous":
+                    self._ambiguous_retrieval_attempts += 1
+                return False
+            resolved_entry = _entry_with_resolved_attribution(
+                entry, retrieval_handle=retrieval_handle
+            )
+            if retrieval_aware_tracking:
+                # Demand observation is diagnostic only. Learning waits for the
+                # provider result to be injected and acknowledged.
+                get_compression_cost_ledger().record_retrieval_call_observation()
+            if self._enable_feedback and not retrieval_aware_tracking:
+                self._log_retrieval(
+                    hash_key=hash_key,
+                    query=query,
+                    items_retrieved=0,
+                    total_items=entry.original_item_count,
+                    tool_name=resolved_entry.tool_name,
+                    retrieval_type="observed_tool_call",
+                    tool_signature_hash=resolved_entry.tool_signature_hash,
+                )
+        if self._enable_feedback and not retrieval_aware_tracking:
+            self.process_pending_feedback()
+        return True
+
     def get_metadata(
         self,
         hash_key: str,
+        *,
+        retrieval_handle: str | None = None,
     ) -> dict[str, Any] | None:
         """Get metadata about a stored entry without retrieving full content.
 
@@ -521,9 +1031,17 @@ class CompressionStore:
                 self._stale_heap_entries += 1
                 return None
 
+            attribution = resolve_entry_attribution(entry, retrieval_handle=retrieval_handle)
             return {
                 "hash": entry.hash,
-                "tool_name": entry.tool_name,
+                "tool_name": attribution["tool_name"],
+                "tool_call_id": attribution["tool_call_id"],
+                "session_id": attribution["session_id"],
+                "request_id": attribution["request_id"],
+                "compression_event_id": attribution["compression_event_id"],
+                "retrieval_handle": attribution["retrieval_handle"],
+                "provider_slot": attribution["provider_slot"],
+                "attribution_candidate_count": len(_attribution_candidates(entry)),
                 "original_item_count": entry.original_item_count,
                 "compressed_item_count": entry.compressed_item_count,
                 "query_context": entry.query_context,
@@ -649,6 +1167,8 @@ class CompressionStore:
                 "total_original_tokens": total_original_tokens,
                 "total_compressed_tokens": total_compressed_tokens,
                 "total_retrievals": total_retrievals,
+                "ambiguous_retrieval_attempts": self._ambiguous_retrieval_attempts,
+                "rejected_retrieval_references": self._rejected_retrieval_references,
                 "event_count": len(self._retrieval_events),
                 "backend": backend_stats,
             }
@@ -717,6 +1237,8 @@ class CompressionStore:
             self._backend.clear()
             self._retrieval_events.clear()
             self._pending_feedback_events.clear()
+            self._ambiguous_retrieval_attempts = 0
+            self._rejected_retrieval_references = 0
             self._eviction_heap.clear()  # MEDIUM FIX #16: Clear heap too
             self._stale_heap_entries = 0  # CRITICAL FIX: Reset stale counter
 

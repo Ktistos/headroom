@@ -1747,3 +1747,201 @@ async def test_compress_batch_jsonl_skips_blank_lines_and_preserves_tools_when_n
     assert body["tools"] == [{"name": "orig"}]
     assert stats["total_requests"] == 1
     assert stats["errors"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compress_batch_jsonl_scopes_each_retrieval_aware_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_batch_support_modules(monkeypatch)
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.config.ccr_inject_tool = False
+    calls: list[dict] = []
+
+    def apply(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            messages=kwargs["messages"],
+            tokens_before=100,
+            tokens_after=80,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+    rows = [
+        {
+            "custom_id": custom_id,
+            "body": {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "identical tool output",
+                    }
+                ],
+            },
+        }
+        for custom_id in ("row-a", "row-b")
+    ]
+
+    await handler._compress_batch_jsonl(
+        "\n".join(json.dumps(row) for row in rows),
+        "outer-request",
+    )
+
+    assert [call["request_id"] for call in calls] == [
+        "outer-request:line:0:row-a",
+        "outer-request:line:1:row-b",
+    ]
+    assert all(call["session_id"] == "outer-request" for call in calls)
+    assert all(call["recovery_payload_path"] == "openai_chat" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_openai_jsonl_rejection_discards_only_rejected_line_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.transforms.content_router import (
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+        current_policy_side_effect_transaction,
+    )
+
+    install_batch_support_modules(monkeypatch)
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.config.ccr_inject_tool = False
+    state: dict[str, list[int]] = {"committed": [], "discarded": []}
+    calls = 0
+
+    def apply(**kwargs):
+        nonlocal calls
+        row_index = calls
+        calls += 1
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        transaction.register(
+            f"openai-jsonl-row-{row_index}",
+            commit=lambda row_index=row_index: state["committed"].append(row_index),
+            discard=lambda row_index=row_index: state["discarded"].append(row_index),
+        )
+        return SimpleNamespace(
+            messages=[{"role": "tool", "content": f"compressed-{row_index}"}],
+            tokens_before=100,
+            tokens_after=50 if row_index == 0 else 120,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+    rows = [
+        {
+            "custom_id": f"row-{index}",
+            "body": {
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "tool", "content": f"original-{index}"}],
+            },
+        }
+        for index in range(2)
+    ]
+
+    holder = RequestPolicySideEffectHolder()
+    with activate_request_policy_side_effect_holder(holder):
+        lines, _stats = await handler._compress_batch_jsonl(
+            "\n".join(json.dumps(row) for row in rows),
+            "outer-request",
+        )
+        assert state == {"committed": [], "discarded": [1]}
+
+    holder.finalize(commit=True)
+    assert state == {"committed": [0], "discarded": [1]}
+    assert json.loads(lines[0])["body"]["messages"][0]["content"] == "compressed-0"
+    assert json.loads(lines[1])["body"]["messages"][0]["content"] == "original-1"
+
+
+@pytest.mark.asyncio
+async def test_google_batch_row_rejection_does_not_discard_earlier_row_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.transforms.content_router import (
+        RequestPolicySideEffectHolder,
+        activate_request_policy_side_effect_holder,
+        current_policy_side_effect_transaction,
+    )
+
+    install_batch_support_modules(monkeypatch)
+    handler = DummyBatchHandler()
+    handler.config.optimize = True
+    handler.config.ccr_inject_tool = False
+    state: dict[str, list[int]] = {"committed": [], "discarded": []}
+    pipeline_calls: list[dict[str, object]] = []
+
+    def apply(**kwargs):
+        row_index = len(pipeline_calls)
+        pipeline_calls.append(kwargs)
+        transaction = current_policy_side_effect_transaction()
+        assert transaction is not None
+        transaction.register(
+            f"google-batch-row-{row_index}",
+            commit=lambda row_index=row_index: state["committed"].append(row_index),
+            discard=lambda row_index=row_index: state["discarded"].append(row_index),
+        )
+        return SimpleNamespace(
+            messages=[{"role": "user", "content": f"compressed-{row_index}"}],
+            timing={},
+            tokens_before=100,
+            tokens_after=50 if row_index == 0 else 120,
+        )
+
+    handler.openai_pipeline = SimpleNamespace(apply=apply)
+
+    async def payload(request):  # noqa: ANN001
+        return {
+            "batch": {
+                "input_config": {
+                    "requests": {
+                        "requests": [
+                            {
+                                "request": {
+                                    "contents": [{"parts": [{"text": f"original-{index}"}]}]
+                                },
+                                "metadata": {"key": f"row-{index}"},
+                            }
+                            for index in range(2)
+                        ]
+                    }
+                }
+            }
+        }
+
+    sent_bodies: list[dict[str, object]] = []
+
+    async def retry(method, url, headers, body, **kwargs):  # noqa: ANN001
+        sent_bodies.append(body)
+        return FakeResponse(
+            status_code=200,
+            content=b'{"name":"batches/tx"}',
+            json_data={"name": "batches/tx"},
+        )
+
+    async def store_context(*args, **kwargs):  # noqa: ANN002, ANN003
+        return None
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+    monkeypatch.setattr(handler, "_retry_request", retry)
+    monkeypatch.setattr(handler, "_store_google_batch_context", store_context)
+
+    holder = RequestPolicySideEffectHolder()
+    with activate_request_policy_side_effect_holder(holder):
+        response = await handler.handle_google_batch_create(FakeRequest("{}"), "gemini-pro")
+        assert response.status_code == 200
+        assert state == {"committed": [], "discarded": [1]}
+
+    holder.finalize(commit=True)
+    assert state == {"committed": [0], "discarded": [1]}
+    assert [call["request_id"] for call in pipeline_calls] == [
+        "req-1:item:0",
+        "req-1:item:1",
+    ]
+    rows = sent_bodies[0]["batch"]["input_config"]["requests"]["requests"]
+    assert rows[0]["request"]["contents"][0]["parts"][0]["text"] == "compressed-0"
+    assert rows[1]["request"]["contents"][0]["parts"][0]["text"] == "original-1"

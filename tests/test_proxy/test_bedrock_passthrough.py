@@ -152,6 +152,47 @@ def test_invoke_forwards_compressed_messages():
     assert resp.status_code == 200
     _, forwarded = _forwarded(http)
     assert forwarded["messages"] == compressed
+    pipeline_kwargs = proxy.anthropic_pipeline.apply.call_args.kwargs
+    assert pipeline_kwargs["request_id"]
+    assert pipeline_kwargs["session_id"] == pipeline_kwargs["request_id"]
+    assert pipeline_kwargs["recovery_payload_path"] == "anthropic"
+
+
+def test_invoke_rejects_provider_token_inflation(monkeypatch):
+    from headroom.transforms.content_router import current_policy_side_effect_transaction
+
+    monkeypatch.setenv("HEADROOM_RETRIEVAL_AWARE", "control")
+    state: dict[str, int] = {"committed": 0, "discarded": 0}
+    app = create_app(_make_config())
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        http = _install_fake_client(proxy, _FakeUpstream())
+
+        def apply(**_kwargs):
+            transaction = current_policy_side_effect_transaction()
+            assert transaction is not None
+            transaction.register(
+                "bedrock-inflated",
+                commit=lambda: state.__setitem__("committed", state["committed"] + 1),
+                discard=lambda: state.__setitem__("discarded", state["discarded"] + 1),
+            )
+            return _FakeResult(
+                [{"role": "user", "content": "inflated replacement"}],
+                tokens_before=100,
+                tokens_after=120,
+            )
+
+        proxy.anthropic_pipeline.apply = apply
+        body = {
+            "messages": [{"role": "user", "content": "original"}],
+            "max_tokens": 8,
+        }
+        response = client.post(INVOKE, json=body)
+
+    assert response.status_code == 200
+    _, forwarded = _forwarded(http)
+    assert forwarded["messages"] == body["messages"]
+    assert state == {"committed": 0, "discarded": 1}
 
 
 def test_compressed_body_drops_stale_content_length():

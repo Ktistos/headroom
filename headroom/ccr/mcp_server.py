@@ -31,6 +31,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MethodType
 from typing import Any
 
 from headroom import paths as _paths
@@ -94,6 +95,25 @@ DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787"
 # blocking stdin-reader thread wedges server.run() forever, orphaning this
 # process under init/launchd. The watchdog reaps us once we are reparented.
 PARENT_DEATH_POLL_INTERVAL = 5.0
+
+
+def _retrieval_tool_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the model-visible MCP content envelope for one retrieval."""
+    from headroom.transforms.retrieval_aware_policy import model_visible_mcp_payload
+
+    return model_visible_mcp_payload(result)
+
+
+@dataclass(frozen=True)
+class _PendingMCPRecovery:
+    """Recovery metadata held until the MCP response is written successfully."""
+
+    hash_key: str
+    payload: dict[str, Any]
+    attribution_source: Any
+    retrieval_event_id: str
+    retrieval_handle: str | None
+    commit_local_feedback: bool
 
 
 def _format_session_summary(
@@ -378,6 +398,8 @@ class HeadroomMCPServer:
         self._stats = SessionStats()
         self._local_store: Any = None  # Lazy-initialized CompressionStore
         self._compressor_initialized = False
+        self._pending_mcp_recoveries: dict[str, _PendingMCPRecovery] = {}
+        self._delivery_hook_installed = False
         # File read cache: path → (content_hash, ccr_hash, line_count, token_count)
         self._file_cache: dict[str, tuple[str, str, int, int]] = {}
 
@@ -385,7 +407,77 @@ class HeadroomMCPServer:
             raise ImportError("MCP SDK not installed. Install with: pip install mcp")
 
         self.server: Server = Server("headroom")
+        self._install_delivery_hook()
         self._setup_handlers()
+
+    @staticmethod
+    def _request_key(request_id: Any, session: Any = None) -> str:
+        """Scope JSON-RPC request IDs to their transport session and type."""
+        session_scope = f"session-{id(session):x}" if session is not None else "unscoped"
+        return f"{session_scope}:{type(request_id).__name__}:{request_id!s}"
+
+    def _current_request_key(self) -> str | None:
+        try:
+            request_context = self.server.request_context
+            request_id = getattr(request_context, "request_id", None)
+            session = getattr(request_context, "session", None)
+        except Exception:
+            return None
+        return None if request_id is None else self._request_key(request_id, session)
+
+    def _install_delivery_hook(self) -> None:
+        """Commit MCP recovery only after the SDK writes the response.
+
+        The low-level SDK has no public post-send hook. Wrapping this server
+        instance's request dispatcher keeps the accounting boundary at the
+        successful ``RequestResponder.respond`` call. A cancelled request or a
+        closed transport therefore discards the prepared recovery. The wrapper
+        is deliberately feature-local and leaves other Server instances alone.
+        """
+        original_handle_request = getattr(self.server, "_handle_request", None)
+        if not callable(original_handle_request):
+            # Unit-test stubs and older SDKs do not expose the low-level hook.
+            # In that case we fail closed: retrieval still works, but no
+            # model-input charge is inferred before confirmed delivery.
+            return
+
+        owner = self
+
+        async def delivery_aware_handle_request(
+            _server: Any,
+            message: Any,
+            request: Any,
+            session: Any,
+            lifespan_context: Any,
+            raise_exceptions: bool,
+        ) -> None:
+            request_key = owner._request_key(message.request_id, session)
+            original_respond = message.respond
+
+            async def respond_then_commit(response: Any) -> None:
+                await original_respond(response)
+                await owner._commit_pending_mcp_recovery(request_key)
+
+            message.respond = respond_then_commit
+            try:
+                await original_handle_request(
+                    message,
+                    request,
+                    session,
+                    lifespan_context,
+                    raise_exceptions,
+                )
+            finally:
+                # A transport failure is swallowed by the SDK dispatcher. Any
+                # still-pending item was not written and must not be charged.
+                owner._pending_mcp_recoveries.pop(request_key, None)
+                message.respond = original_respond
+
+        self.server._handle_request = MethodType(  # type: ignore[method-assign]
+            delivery_aware_handle_request,
+            self.server,
+        )
+        self._delivery_hook_installed = True
 
     def _get_local_store(self) -> Any:
         """Get the shared compression store singleton (lazy init).
@@ -460,19 +552,67 @@ class HeadroomMCPServer:
     async def _retrieve_content(
         self,
         hash_key: str,
+        retrieval_handle: str | None = None,
+        retrieval_event_id: str | None = None,
     ) -> dict[str, Any]:
-        """Retrieve content by hash. Checks local store first, then proxy.
+        """Retrieve content without treating the read as model injection.
+
+        Raw/internal callers use this method. The public MCP handler calls
+        :meth:`_retrieve_content_with_attribution` and schedules accounting at
+        the transport's successful response-write boundary instead.
+        """
+        (
+            result,
+            _attribution_source,
+            _commit_local_feedback,
+        ) = await self._retrieve_content_with_attribution(
+            hash_key,
+            retrieval_handle,
+            retrieval_event_id,
+        )
+        return result
+
+    async def _retrieve_content_with_attribution(
+        self,
+        hash_key: str,
+        retrieval_handle: str | None = None,
+        retrieval_event_id: str | None = None,
+    ) -> tuple[dict[str, Any], Any | None, bool]:
+        """Resolve content and return private attribution for a later delivery.
 
         Retrieval is by hash and always returns the full original content.
+        The boolean indicates whether this process owns the store-feedback
+        commit. No accounting or feedback side effect occurs here.
         """
         # Check local store first
         store = self._get_local_store()
         entry_status = store.get_entry_status(hash_key, clean_expired=False)
-        entry = store.retrieve(hash_key)
+        reference_status_fn = getattr(store, "get_retrieval_reference_status", None)
+        reference_status = (
+            reference_status_fn(hash_key, retrieval_handle=retrieval_handle)
+            if entry_status.get("status") == "available" and callable(reference_status_fn)
+            else entry_status
+        )
+        if reference_status.get("status") in {"ambiguous", "unresolved"}:
+            await self._report_rejection_via_proxy(
+                hash_key,
+                retrieval_event_id=retrieval_event_id,
+                reason=str(reference_status["status"]),
+            )
+            return (
+                {
+                    "error": f"retrieval reference {reference_status['status']}",
+                    "hash": hash_key,
+                    "status": reference_status["status"],
+                },
+                None,
+                False,
+            )
+        internal_retrieve = getattr(store, "retrieve_for_internal_use", store.retrieve)
+        entry = internal_retrieve(hash_key, retrieval_handle=retrieval_handle)
         expired_entry_status = None
         if entry:
-            self._stats.record_retrieval(hash_key)
-            return {
+            result = {
                 "hash": hash_key,
                 "source": "local",
                 "original_content": entry.original_content,
@@ -480,6 +620,7 @@ class HeadroomMCPServer:
                 "compressed_item_count": entry.compressed_item_count,
                 "retrieval_count": entry.retrieval_count,
             }
+            return result, entry, True
         if entry_status.get("status") == "expired":
             expired_entry_status = entry_status
         elif entry_status.get("status") == "available":
@@ -497,11 +638,24 @@ class HeadroomMCPServer:
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
             try:
-                result = await self._retrieve_via_proxy(hash_key)
-                if "error" not in result:
-                    result["source"] = "proxy"
-                    self._stats.record_retrieval(hash_key)
-                    return result
+                proxy_result = await self._retrieve_via_proxy(
+                    hash_key,
+                    retrieval_handle,
+                    retrieval_event_id=retrieval_event_id,
+                )
+                if "error" not in proxy_result:
+                    # Keep the model-visible fallback shape aligned with local
+                    # MCP recovery. Raw HTTP attribution and transport fields
+                    # stay private to the accounting report.
+                    result = {
+                        "hash": hash_key,
+                        "source": "proxy",
+                        "original_content": proxy_result.get("original_content", ""),
+                        "original_item_count": proxy_result.get("original_item_count", 0),
+                        "compressed_item_count": proxy_result.get("compressed_item_count", 0),
+                        "retrieval_count": proxy_result.get("retrieval_count", 0),
+                    }
+                    return result, proxy_result, False
             except Exception:
                 pass  # Proxy unavailable, that's fine
 
@@ -510,41 +664,223 @@ class HeadroomMCPServer:
                 "ttl_seconds",
                 expired_entry_status["default_ttl_seconds"],
             )
-            return {
-                "error": (
-                    f"{format_retrieval_miss_detail(expired_entry_status)}. "
-                    "Do not retry the same hash. Re-run the source command or re-read the source file."
-                ),
-                "hash": hash_key,
-                "status": "expired",
-                "ttl_seconds": ttl_seconds,
-                "age_seconds": expired_entry_status.get("age_seconds"),
-                "hint": (
-                    "Use the source of truth to regenerate fresh content. "
-                    "Re-run the command or re-read the file."
-                ),
-            }
+            return (
+                {
+                    "error": (
+                        f"{format_retrieval_miss_detail(expired_entry_status)}. "
+                        "Do not retry the same hash. Re-run the source command or re-read the source file."
+                    ),
+                    "hash": hash_key,
+                    "status": "expired",
+                    "ttl_seconds": ttl_seconds,
+                    "age_seconds": expired_entry_status.get("age_seconds"),
+                    "hint": (
+                        "Use the source of truth to regenerate fresh content. "
+                        "Re-run the command or re-read the file."
+                    ),
+                },
+                None,
+                False,
+            )
 
-        return {
-            "error": "Content not found. It may have expired or the hash may be incorrect.",
+        return (
+            {
+                "error": "Content not found. It may have expired or the hash may be incorrect.",
+                "hash": hash_key,
+                "hint": "To recover: if the compression marker references a file Read, "
+                "re-read that file (the path is in the marker; disk is the source of "
+                "truth). If it was command output, re-run the command. Content "
+                "compressed via headroom_compress is stored for the session; content "
+                "compressed by the proxy uses the configured CCR TTL.",
+            },
+            None,
+            False,
+        )
+
+    async def _commit_pending_mcp_recovery(self, request_key: str) -> None:
+        """Account a prepared recovery after its MCP response was delivered."""
+        pending = self._pending_mcp_recoveries.pop(request_key, None)
+        if pending is None:
+            return
+        try:
+            report_result = await self._report_recovery_via_proxy(
+                pending.hash_key,
+                pending.payload,
+                pending.attribution_source,
+                retrieval_event_id=pending.retrieval_event_id,
+            )
+            report_status = str((report_result or {}).get("status") or "")
+            feedback_committed = bool((report_result or {}).get("feedback_committed"))
+
+            if not self.check_proxy:
+                from headroom.transforms.retrieval_aware_policy import (
+                    account_recovery_payload,
+                    compression_cost_tracking_enabled,
+                    get_compression_cost_ledger,
+                )
+
+                ledger = get_compression_cost_ledger()
+                if compression_cost_tracking_enabled():
+                    report_status = account_recovery_payload(
+                        pending.attribution_source,
+                        pending.payload,
+                        retrieval_event_id=pending.retrieval_event_id,
+                        ledger=ledger,
+                    ).value
+                else:
+                    report_status = (
+                        "feedback_only"
+                        if ledger.claim_feedback_report(pending.retrieval_event_id)
+                        else "duplicate"
+                    )
+            elif report_result is None and pending.commit_local_feedback:
+                # Preserve retry idempotency even if the proxy accounting
+                # endpoint is temporarily unavailable. This claim is local to
+                # the MCP process and cannot collide with the proxy's ledger.
+                from headroom.transforms.retrieval_aware_policy import (
+                    get_compression_cost_ledger,
+                )
+
+                report_status = (
+                    "feedback_only"
+                    if get_compression_cost_ledger().claim_feedback_report(
+                        pending.retrieval_event_id
+                    )
+                    else "duplicate"
+                )
+
+            if (
+                pending.commit_local_feedback
+                and report_status in {"attributed", "unattributed", "disabled", "feedback_only"}
+                and not feedback_committed
+            ):
+                self._get_local_store().retrieve(
+                    pending.hash_key,
+                    retrieval_handle=pending.retrieval_handle,
+                )
+            if report_status != "duplicate":
+                self._stats.record_retrieval(pending.hash_key)
+        except Exception:
+            # Delivery already succeeded; accounting is best-effort and must
+            # never turn a valid MCP tool response into a protocol error.
+            logger.debug(
+                "Post-delivery MCP recovery accounting failed for hash=%s",
+                pending.hash_key,
+                exc_info=True,
+            )
+
+    async def _report_recovery_via_proxy(
+        self,
+        hash_key: str,
+        payload: Any,
+        attribution_source: Any,
+        *,
+        retrieval_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Best-effort idempotent report of the model-visible MCP envelope."""
+        if not self.check_proxy or not HTTPX_AVAILABLE:
+            return None
+        from headroom.transforms.retrieval_aware_policy import (
+            CompressionCostLedger,
+            estimate_payload_tokens,
+        )
+
+        def field(name: str) -> str:
+            if isinstance(attribution_source, dict):
+                return str(attribution_source.get(name, "") or "")
+            return str(getattr(attribution_source, name, "") or "")
+
+        report = {
             "hash": hash_key,
-            "hint": "To recover: if the compression marker references a file Read, "
-            "re-read that file (the path is in the marker; disk is the source of "
-            "truth). If it was command output, re-run the command. Content "
-            "compressed via headroom_compress is stored for the session; content "
-            "compressed by the proxy uses the configured CCR TTL.",
+            "retrieval_event_id": (
+                retrieval_event_id or CompressionCostLedger.new_retrieval_event_id()
+            ),
+            "recovery_payload_tokens": estimate_payload_tokens(payload),
+            "compression_event_id": field("compression_event_id"),
+            "session_id": field("session_id"),
+            "request_id": field("request_id"),
+            "tool_call_id": field("tool_call_id"),
+            "provider_slot": field("provider_slot"),
+            "retrieval_handle": field("retrieval_handle"),
         }
+        headers = {}
+        secret = os.environ.get("HEADROOM_RETRIEVAL_ACCOUNT_SECRET", "")
+        if secret:
+            headers["x-headroom-retrieval-account-secret"] = secret
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=15.0)
+        try:
+            response = await self._http_client.post(
+                f"{self.proxy_url}/v1/retrieve/account",
+                json=report,
+                headers=headers,
+                timeout=1.0,
+            )
+            response.raise_for_status()
+            response_data = response.json()
+            return response_data if isinstance(response_data, dict) else None
+        except Exception:
+            logger.debug(
+                "Recovery-payload proxy accounting failed for local hash=%s",
+                hash_key,
+                exc_info=True,
+            )
+            return None
+
+    async def _report_rejection_via_proxy(
+        self,
+        hash_key: str,
+        *,
+        retrieval_event_id: str | None,
+        reason: str,
+    ) -> None:
+        """Report a fail-closed MCP attempt without charging model payload."""
+        if not self.check_proxy or not HTTPX_AVAILABLE:
+            return
+        from headroom.transforms.retrieval_aware_policy import CompressionCostLedger
+
+        report = {
+            "hash": hash_key,
+            "retrieval_event_id": (
+                retrieval_event_id or CompressionCostLedger.new_retrieval_event_id()
+            ),
+            "recovery_payload_tokens": 0,
+            "rejected_reason": reason,
+        }
+        headers = {}
+        secret = os.environ.get("HEADROOM_RETRIEVAL_ACCOUNT_SECRET", "")
+        if secret:
+            headers["x-headroom-retrieval-account-secret"] = secret
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=15.0)
+        try:
+            response = await self._http_client.post(
+                f"{self.proxy_url}/v1/retrieve/account",
+                json=report,
+                headers=headers,
+                timeout=1.0,
+            )
+            response.raise_for_status()
+        except Exception:
+            logger.debug("Rejected-retrieval proxy accounting failed", exc_info=True)
 
     async def _retrieve_via_proxy(
         self,
         hash_key: str,
+        retrieval_handle: str | None = None,
+        *,
+        retrieval_event_id: str | None = None,
     ) -> dict[str, Any]:
         """Retrieve full content by hash via proxy's HTTP endpoint."""
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=15.0)
 
         url = f"{self.proxy_url}/v1/retrieve"
-        payload: dict[str, str] = {"hash": hash_key}
+        payload: dict[str, Any] = {"hash": hash_key}
+        if retrieval_handle:
+            payload["handle"] = retrieval_handle
+        if retrieval_event_id:
+            payload["retrieval_event_id"] = retrieval_event_id
 
         response = await self._http_client.post(url, json=payload)
 
@@ -651,6 +987,11 @@ class HeadroomMCPServer:
                                 "type": "string",
                                 "description": "Hash key from compression (e.g., 'abc123' from hash=abc123)",
                             },
+                            "handle": {
+                                "type": "string",
+                                "pattern": "^rh-[0-9a-fA-F]{32}$",
+                                "description": "Opaque event handle from <<ccr:hash@rh-...>>, when present",
+                            },
                         },
                         "required": ["hash"],
                     },
@@ -709,9 +1050,9 @@ class HeadroomMCPServer:
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             started = time.perf_counter()
             logger.info(
-                "event=mcp_tool_call_received tool=%s arguments=%s",
+                "event=mcp_tool_call_received tool=%s argument_keys=%s",
                 name,
-                json.dumps(arguments, ensure_ascii=False, default=str),
+                sorted(str(key) for key in arguments),
             )
             try:
                 if name == COMPRESS_TOOL_NAME:
@@ -730,14 +1071,11 @@ class HeadroomMCPServer:
                         )
                     ]
                 logger.info(
-                    "event=mcp_tool_call_completed tool=%s duration_ms=%.2f output=%s",
+                    "event=mcp_tool_call_completed tool=%s duration_ms=%.2f output_items=%d output_chars=%d",
                     name,
                     (time.perf_counter() - started) * 1000.0,
-                    json.dumps(
-                        [getattr(item, "text", str(item)) for item in result],
-                        ensure_ascii=False,
-                        default=str,
-                    ),
+                    len(result),
+                    sum(len(str(getattr(item, "text", ""))) for item in result),
                 )
                 return result
             except Exception as e:
@@ -822,6 +1160,26 @@ class HeadroomMCPServer:
             pass
         return "unknown"
 
+    def _current_retrieval_event_id(self, hash_key: str, retrieval_handle: str) -> str:
+        """Use the MCP JSON-RPC request ID when the SDK exposes it."""
+        from headroom.transforms.retrieval_aware_policy import (
+            CompressionCostLedger,
+            stable_retrieval_event_id,
+        )
+
+        try:
+            request_context = self.server.request_context
+            raw_request_id = getattr(request_context, "request_id", None)
+            session = getattr(request_context, "session", None)
+            request_id = (
+                "" if raw_request_id is None else self._request_key(raw_request_id, session)
+            )
+        except Exception:
+            request_id = ""
+        if request_id:
+            return stable_retrieval_event_id("mcp_request", request_id, hash_key, retrieval_handle)
+        return CompressionCostLedger.new_retrieval_event_id()
+
     async def _handle_retrieve(self, arguments: dict[str, Any]) -> list[TextContent]:
         """Handle headroom_retrieve tool call."""
         hash_key = arguments.get("hash")
@@ -834,14 +1192,41 @@ class HeadroomMCPServer:
             ]
 
         logger.info("event=mcp_retrieve_started hash=%s", hash_key)
-        result = await self._retrieve_content(hash_key)
-        logger.info(
-            "event=mcp_retrieve_completed hash=%s result=%s",
+        retrieval_handle = str(arguments.get("handle") or "")
+        retrieval_event_id = self._current_retrieval_event_id(hash_key, retrieval_handle)
+        (
+            result,
+            attribution_source,
+            commit_local_feedback,
+        ) = await self._retrieve_content_with_attribution(
             hash_key,
-            json.dumps(result, ensure_ascii=False, default=str),
+            retrieval_handle or None,
+            retrieval_event_id=retrieval_event_id,
+        )
+        logger.info(
+            "event=mcp_retrieve_completed hash=%s source=%s status=%s original_item_count=%s",
+            hash_key,
+            result.get("source", ""),
+            result.get("status", "error" if "error" in result else "available"),
+            result.get("original_item_count", 0),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        payload = _retrieval_tool_payload(result)
+        request_key = self._current_request_key()
+        if (
+            attribution_source is not None
+            and request_key is not None
+            and self._delivery_hook_installed
+        ):
+            self._pending_mcp_recoveries[request_key] = _PendingMCPRecovery(
+                hash_key=hash_key,
+                payload=payload,
+                attribution_source=attribution_source,
+                retrieval_event_id=retrieval_event_id,
+                retrieval_handle=retrieval_handle or None,
+                commit_local_feedback=commit_local_feedback,
+            )
+        return [TextContent(type="text", text=payload["content"][0]["text"])]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""

@@ -12,6 +12,7 @@ import logging
 import os
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,11 @@ from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
 from headroom.proxy.model_router import estimate_input_tokens
 from headroom.proxy.outcome import RequestOutcome
+from headroom.transforms.content_router import (
+    PolicySideEffectTransaction,
+    activate_policy_side_effect_transaction,
+    current_policy_side_effect_transaction,
+)
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -1558,7 +1564,9 @@ class AnthropicHandlerMixin:
                                     idle_seconds=idle_seconds,
                                     biases=biases,
                                     request_id=request_id,
+                                    session_id=session_id,
                                     compression_policy=compression_policy,
+                                    recovery_payload_path="anthropic",
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 lambda bg_result: comp_cache.update_from_result(
@@ -1602,8 +1610,10 @@ class AnthropicHandlerMixin:
                                             idle_seconds=idle_seconds,
                                             biases=biases,
                                             request_id=request_id,
+                                            session_id=session_id,
                                             compression_policy=compression_policy,
                                             skip_kompress=True,
+                                            recovery_payload_path="anthropic",
                                             **proxy_pipeline_kwargs(self.config),
                                         ),
                                         timeout=COLD_START_FAST_PASS_TIMEOUT_SECONDS,
@@ -1652,7 +1662,9 @@ class AnthropicHandlerMixin:
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         request_id=request_id,
+                                        session_id=session_id,
                                         compression_policy=compression_policy,
+                                        recovery_payload_path="anthropic",
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1693,7 +1705,9 @@ class AnthropicHandlerMixin:
                                     frozen_message_count=frozen_message_count,
                                     biases=biases,
                                     request_id=request_id,
+                                    session_id=session_id,
                                     compression_policy=compression_policy,
+                                    recovery_payload_path="anthropic",
                                     **proxy_pipeline_kwargs(self.config),
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1753,7 +1767,9 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=frozen_message_count,
                                         biases=biases,
                                         request_id=request_id,
+                                        session_id=session_id,
                                         compression_policy=compression_policy,
+                                        recovery_payload_path="anthropic",
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1825,7 +1841,9 @@ class AnthropicHandlerMixin:
                                         idle_seconds=idle_seconds,
                                         biases=biases,
                                         request_id=request_id,
+                                        session_id=session_id,
                                         compression_policy=compression_policy,
+                                        recovery_payload_path="anthropic",
                                         **proxy_pipeline_kwargs(self.config),
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
@@ -1945,6 +1963,9 @@ class AnthropicHandlerMixin:
                     f"[{request_id}] Optimization inflated tokens "
                     f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
                 )
+                from headroom.transforms.content_router import finalize_request_policy_side_effects
+
+                finalize_request_policy_side_effects(commit=False, renew=True)
                 optimized_messages = original_messages
                 optimized_tokens = original_tokens
                 transforms_applied = []
@@ -2218,10 +2239,14 @@ class AnthropicHandlerMixin:
                     # `feedback_no_silent_fallbacks`.
                     if self.ccr_context_tracker and ccr_workspace_key:
                         self._turn_counter += 1
-                        for hash_key in injector.detected_hashes:
-                            # Get compression metadata from store
+                        for reference in injector.detected_references:
+                            hash_key = reference.hash_key
+                            # Get compression metadata from the exact emitted event.
                             store = get_compression_store()
-                            entry = store.get_metadata(hash_key)
+                            entry = store.get_metadata(
+                                hash_key,
+                                retrieval_handle=reference.retrieval_handle or None,
+                            )
                             if entry:
                                 if looks_like_claude_code_compact_summary(
                                     entry.get("query_context"),
@@ -2240,6 +2265,7 @@ class AnthropicHandlerMixin:
                                     original_count=entry.get("original_item_count", 0),
                                     compressed_count=entry.get("compressed_item_count", 0),
                                     workspace_key=ccr_workspace_key,
+                                    retrieval_handle=reference.retrieval_handle,
                                     query_context=entry.get("query_context", ""),
                                     sample_content=entry.get("compressed_content", "")[:500],
                                 )
@@ -2297,13 +2323,25 @@ class AnthropicHandlerMixin:
                                     "in cache mode to preserve next-turn prefix stability"
                                 )
                             else:
-                                optimized_messages = (
+                                expanded_messages = (
                                     self._append_context_to_latest_non_frozen_user_turn(
                                         optimized_messages,
                                         expansion_text,
                                         frozen_message_count=frozen_message_count,
                                     )
                                 )
+                                if expanded_messages is not optimized_messages:
+                                    optimized_messages = expanded_messages
+                                    self.ccr_context_tracker.account_injected_expansions(
+                                        expansions,
+                                        expansion_text,
+                                        injection_event_id=request_id,
+                                    )
+                                else:
+                                    logger.info(
+                                        f"[{request_id}] CCR: proactive expansion was not "
+                                        "injected; no eligible non-frozen user text block"
+                                    )
 
             # Traffic Learner: Extract patterns from inbound tool results
             if self.traffic_learner:
@@ -3705,6 +3743,11 @@ class AnthropicHandlerMixin:
                                         headers=ccr_outbound_headers,
                                         timeout=self._anthropic_buffered_request_timeout(),
                                     )
+                                    if not 200 <= cont_response.status_code < 300:
+                                        raise RuntimeError(
+                                            "Anthropic CCR continuation was rejected "
+                                            f"with HTTP {cont_response.status_code}"
+                                        )
                                     logger.info(
                                         f"CCR: Got response status={cont_response.status_code}, "
                                         f"content-encoding={cont_response.headers.get('content-encoding')}"
@@ -4507,7 +4550,7 @@ class AnthropicHandlerMixin:
         pipeline_timing: dict[str, float] = {}
 
         # Apply compression to each request in the batch
-        for batch_req in requests_list:
+        for batch_index, batch_req in enumerate(requests_list):
             custom_id = batch_req.get("custom_id", "")
             params = batch_req.get("params", {})
             canonical_params = dict(params)
@@ -4525,6 +4568,12 @@ class AnthropicHandlerMixin:
                     }
                 )
                 continue
+
+            item_request_id = f"{request_id}:item:{batch_index}:{custom_id}"
+            parent_transaction = current_policy_side_effect_transaction()
+            item_transaction = (
+                PolicySideEffectTransaction() if parent_transaction is not None else None
+            )
 
             if original_tools is not None:
                 sorted_tools = self._sort_tools_deterministically(original_tools)
@@ -4550,20 +4599,27 @@ class AnthropicHandlerMixin:
                     # Offload off the event loop (#1701): an inline apply()
                     # blocks every other request for the duration; a timeout
                     # here is caught below and passes the item through.
-                    result = await self._run_compression_in_executor(
-                        lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count: (
-                            self.anthropic_pipeline.apply(
-                                messages=messages,
-                                model=model,
-                                model_limit=context_limit,
-                                context=extract_user_query(messages),
-                                frozen_message_count=frozen_message_count,
-                                request_id=request_id,
-                                **proxy_pipeline_kwargs(self.config),
-                            )
-                        ),
-                        timeout=COMPRESSION_TIMEOUT_SECONDS,
-                    )
+                    with (
+                        activate_policy_side_effect_transaction(item_transaction)
+                        if item_transaction is not None
+                        else nullcontext()
+                    ):
+                        result = await self._run_compression_in_executor(
+                            lambda messages=messages, model=model, context_limit=context_limit, frozen_message_count=frozen_message_count, item_request_id=item_request_id: (
+                                self.anthropic_pipeline.apply(
+                                    messages=messages,
+                                    model=model,
+                                    model_limit=context_limit,
+                                    context=extract_user_query(messages),
+                                    frozen_message_count=frozen_message_count,
+                                    request_id=item_request_id,
+                                    session_id=request_id,
+                                    recovery_payload_path="anthropic",
+                                    **proxy_pipeline_kwargs(self.config),
+                                )
+                            ),
+                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        )
 
                     optimized_messages = result.messages
                     for k, v in result.timing.items():
@@ -4577,6 +4633,8 @@ class AnthropicHandlerMixin:
                         f"[{request_id}] Batch item optimization inflated tokens "
                         f"({original_tokens} -> {optimized_tokens}), reverting"
                     )
+                    if item_transaction is not None:
+                        item_transaction.discard()
                     optimized_messages = messages
                     optimized_tokens = original_tokens
 
@@ -4616,6 +4674,8 @@ class AnthropicHandlerMixin:
                         "params": compressed_params,
                     }
                 )
+                if item_transaction is not None and parent_transaction is not None:
+                    parent_transaction.merge_from(item_transaction)
 
                 if tokens_saved > 0:
                     logger.debug(
@@ -4625,6 +4685,8 @@ class AnthropicHandlerMixin:
                     )
 
             except Exception as e:
+                if item_transaction is not None:
+                    item_transaction.discard()
                 logger.warning(
                     f"[{request_id}] Optimization failed for batch request '{custom_id}': {e}"
                 )

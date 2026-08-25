@@ -18,6 +18,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
+from .retrieval_reference import (
+    RetrievalReference,
+    references_in_text,
+    validate_retrieval_handle,
+)
+
 # Tool name constant - used for matching tool calls
 CCR_TOOL_NAME = "headroom_retrieve"
 
@@ -58,7 +64,8 @@ def create_ccr_tool_definition(
             "description": (
                 "Retrieve original uncompressed content that was compressed to save tokens. "
                 "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+                "The hash is provided in compression markers. If a <<ccr:hash@rh-...>> "
+                "marker includes an event handle, pass both hash and handle."
             ),
             "parameters": {
                 "type": "object",
@@ -66,6 +73,11 @@ def create_ccr_tool_definition(
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
+                    },
+                    "handle": {
+                        "type": "string",
+                        "pattern": "^rh-[0-9a-fA-F]{32}$",
+                        "description": "Opaque event handle from <<ccr:hash@rh-...>>; omit for legacy markers",
                     },
                 },
                 "required": ["hash"],
@@ -83,7 +95,8 @@ def create_ccr_tool_definition(
             "description": (
                 "Retrieve original uncompressed content that was compressed to save tokens. "
                 "Use this when you need more data than what's shown in compressed tool results. "
-                "The hash is provided in compression markers like [N items compressed... hash=abc123]."
+                "The hash is provided in compression markers. If a <<ccr:hash@rh-...>> "
+                "marker includes an event handle, pass both hash and handle."
             ),
             "input_schema": {
                 "type": "object",
@@ -91,6 +104,11 @@ def create_ccr_tool_definition(
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker (e.g., 'abc123' from hash=abc123)",
+                    },
+                    "handle": {
+                        "type": "string",
+                        "pattern": "^rh-[0-9a-fA-F]{32}$",
+                        "description": "Opaque event handle from <<ccr:hash@rh-...>>; omit for legacy markers",
                     },
                 },
                 "required": ["hash"],
@@ -103,7 +121,8 @@ def create_ccr_tool_definition(
             "name": CCR_TOOL_NAME,
             "description": (
                 "Retrieve original uncompressed content that was compressed to save tokens. "
-                "Use this when you need more data than what's shown in compressed tool results."
+                "Use this when you need more data than what's shown in compressed tool results. "
+                "Pass the event handle when the marker provides one."
             ),
             "parameters": {
                 "type": "object",
@@ -111,6 +130,11 @@ def create_ccr_tool_definition(
                     "hash": {
                         "type": "string",
                         "description": "Hash key from the compression marker",
+                    },
+                    "handle": {
+                        "type": "string",
+                        "pattern": "^rh-[0-9a-fA-F]{32}$",
+                        "description": "Opaque event handle from the marker, when present",
                     },
                 },
                 "required": ["hash"],
@@ -147,7 +171,7 @@ Some tool outputs have been compressed to reduce context size. If you need
 the full uncompressed data, you can retrieve it using the `{CCR_TOOL_NAME}` tool.
 
 **How to retrieve:**
-- Call `{CCR_TOOL_NAME}(hash="<hash>")` to get the full original content back
+- Call `{CCR_TOOL_NAME}(hash="<hash>", handle="<rh-handle>")` when the marker has an `@rh-...` handle; omit `handle` for legacy markers
 
 **Available hashes:** {hash_list}
 
@@ -190,6 +214,7 @@ class CCRToolInjector:
 
     # Detected compression markers
     _detected_hashes: list[str] = field(default_factory=list)
+    _detected_references: list[RetrievalReference] = field(default_factory=list)
     # Multiple marker patterns to match different compressors:
     # - SmartCrusher: [100 items compressed to 10. Retrieve more: hash=abc123]
     # - Kompress: [100 lines compressed to 10. Retrieve more: hash=abc123]
@@ -230,6 +255,7 @@ class CCRToolInjector:
     def __post_init__(self) -> None:
         # Reset detected hashes
         self._detected_hashes = []
+        self._detected_references = []
 
     @property
     def has_compressed_content(self) -> bool:
@@ -241,6 +267,11 @@ class CCRToolInjector:
         """Get list of detected compression hashes."""
         return self._detected_hashes.copy()
 
+    @property
+    def detected_references(self) -> list[RetrievalReference]:
+        """Get every distinct emission reference, including same-hash handles."""
+        return self._detected_references.copy()
+
     def scan_for_markers(self, messages: list[dict[str, Any]]) -> list[str]:
         """Scan messages for compression markers and extract hashes.
 
@@ -251,6 +282,7 @@ class CCRToolInjector:
             List of detected hash keys.
         """
         self._detected_hashes = []
+        self._detected_references = []
 
         for message in messages:
             content = message.get("content", "")
@@ -297,7 +329,7 @@ class CCRToolInjector:
 
         return self._detected_hashes
 
-    def _scan_text(self, text: str) -> None:
+    def _scan_text(self, text: object) -> None:
         """Scan text for compression markers from any compressor.
 
         Shape-only: this matches the bracket format any compressor (or,
@@ -308,6 +340,15 @@ class CCRToolInjector:
         stays a pure, store-independent text scan (that's what the
         existing marker-format test suite exercises).
         """
+        # Provider envelopes are untrusted. Malformed text blocks should be
+        # preserved by routing and must not make the subsequent CCR scan fail.
+        if not isinstance(text, str):
+            return
+        for reference in references_in_text(text):
+            if reference not in self._detected_references:
+                self._detected_references.append(reference)
+            if reference.hash_key not in self._detected_hashes:
+                self._detected_hashes.append(reference.hash_key)
         for pattern in self._marker_patterns:
             matches = pattern.findall(text)
             for match in matches:
@@ -318,6 +359,7 @@ class CCRToolInjector:
                     hash_key = match  # Single capture group (generic pattern)
                 if hash_key and hash_key not in self._detected_hashes:
                     self._detected_hashes.append(hash_key)
+                    self._detected_references.append(RetrievalReference(hash_key, ""))
 
     def verify_ownership(self, store: _HashOwnershipStore | None = None) -> list[str]:
         """Drop any detected hash the compression store doesn't recognize.
@@ -370,6 +412,11 @@ class CCRToolInjector:
                 return False
 
         self._detected_hashes = [h for h in self._detected_hashes if _safe_exists(h)]
+        self._detected_references = [
+            reference
+            for reference in self._detected_references
+            if reference.hash_key in self._detected_hashes
+        ]
         return self._detected_hashes
 
     def inject_tool_definition(
@@ -532,84 +579,49 @@ class CCRToolInjector:
         return updated_messages, updated_tools if updated_tools else None, was_injected
 
 
-def parse_tool_call(
-    tool_call: dict[str, Any],
-    provider: str = "anthropic",
-) -> str | None:
-    """Parse a CCR tool call to extract the content hash.
-
-    Args:
-        tool_call: The tool call object from the LLM response.
-        provider: The provider type for format detection.
-
-    Returns:
-        The hash key, or None if this is not a (valid) CCR tool call.
-    """
-    # Get tool name and input data based on provider format
+def _tool_call_input(tool_call: dict[str, Any], provider: str) -> tuple[object, object]:
+    """Return provider-native tool name and decoded input object."""
     if provider == "anthropic":
-        name = tool_call.get("name")
-        input_data = tool_call.get("input", {})
-    elif provider == "openai":
-        # `get("function", {})` returns None for an explicit {"function": null}
-        # (the default only applies to a missing key), so `.get` below would
-        # raise AttributeError on a malformed/partial tool call. Coalesce to {}.
+        return tool_call.get("name"), tool_call.get("input", {})
+    if provider == "openai":
         function = tool_call.get("function") or {}
-        name = function.get("name")
-        # OpenAI passes args as JSON string
-        args_str = function.get("arguments", "{}")
         try:
-            input_data = json.loads(args_str)
+            decoded = json.loads(function.get("arguments", "{}"))
         except (json.JSONDecodeError, TypeError):
-            # TypeError covers a null/None `arguments` value (json.loads(None)).
-            input_data = {}
-    elif provider == "google":
-        # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
-        # Coalesce to {} so an explicit {"functionCall": null} does not crash.
+            decoded = {}
+        return function.get("name"), decoded
+    if provider == "google":
         function_call = tool_call.get("functionCall") or {}
-        name = function_call.get("name")
-        input_data = function_call.get("args", {})
-    elif provider == "openai_responses":
-        # Responses API: flat `function_call` item — name and arguments
-        # live directly on it, not nested under "function" like chat
-        # completions tool_calls.
-        name = tool_call.get("name")
-        args_str = tool_call.get("arguments", "{}")
+        return function_call.get("name"), function_call.get("args", {})
+    if provider == "openai_responses":
         try:
-            input_data = json.loads(args_str)
+            decoded = json.loads(tool_call.get("arguments", "{}"))
         except (json.JSONDecodeError, TypeError):
-            # TypeError covers a null/None `arguments` value (json.loads(None)).
-            input_data = {}
-    else:
-        # Generic fallback
-        name = tool_call.get("name")
-        input_data = tool_call.get("input", tool_call.get("args", {}))
+            decoded = {}
+        return tool_call.get("name"), decoded
+    return tool_call.get("name"), tool_call.get("input", tool_call.get("args", {}))
 
-    if name != CCR_TOOL_NAME:
+
+def parse_tool_call_reference(
+    tool_call: dict[str, Any], provider: str = "anthropic"
+) -> RetrievalReference | None:
+    """Parse a CCR call into its legacy hash and optional event handle."""
+    name, input_data = _tool_call_input(tool_call, provider)
+    if name != CCR_TOOL_NAME or not isinstance(input_data, dict):
         return None
-
-    # A CCR-named tool call whose decoded arguments/input are not an object
-    # (a JSON array/string/number, or a non-dict Anthropic `input`) is simply
-    # not a valid CCR call — return None instead of crashing on `.get`.
-    if not isinstance(input_data, dict):
-        return None
-
     hash_key = input_data.get("hash")
-    if hash_key is None:
-        return None
-
-    # Validate hash format. SmartCrusher emits 12-hex-char hashes while legacy
-    # bracket markers / the compression_store use 24-hex-char hashes; accept
-    # either real length and reject anything else as malformed.
     if not isinstance(hash_key, str) or len(hash_key) not in (12, 24):
         return None
-    # Validate hex characters only
-    if not all(c in "0123456789abcdef" for c in hash_key.lower()):
+    if not all(character in "0123456789abcdef" for character in hash_key.lower()):
         return None
+    raw_handle = input_data.get("handle")
+    handle = validate_retrieval_handle(raw_handle)
+    if raw_handle not in (None, "") and not handle:
+        return None
+    return RetrievalReference(hash_key.lower(), handle)
 
-    # Normalise to lowercase. The compression store always keys entries by a
-    # lowercase hash (sha256 hexdigest, and `explicit_hash.lower()` on store),
-    # and `retrieve` / `get_entry_status` look up the key verbatim. The hex
-    # validation above is already case-insensitive, so a model that echoes the
-    # marker hash uppercase passed validation but then missed the store lookup,
-    # failing an otherwise-valid retrieval. Return the canonical lowercase form.
-    return hash_key.lower()
+
+def parse_tool_call(tool_call: dict[str, Any], provider: str = "anthropic") -> str | None:
+    """Backward-compatible parser returning only the content hash."""
+    reference = parse_tool_call_reference(tool_call, provider)
+    return reference.hash_key if reference is not None else None

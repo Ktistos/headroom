@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -17,6 +18,11 @@ if TYPE_CHECKING:
 from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, extract_tags
 from headroom.proxy.outcome import RequestOutcome
+from headroom.transforms.content_router import (
+    PolicySideEffectTransaction,
+    activate_policy_side_effect_transaction,
+    current_policy_side_effect_transaction,
+)
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -149,6 +155,10 @@ class BatchHandlerMixin:
                 compressed_requests.append(batch_req)
                 continue
 
+            parent_transaction = current_policy_side_effect_transaction()
+            item_transaction = (
+                PolicySideEffectTransaction() if parent_transaction is not None else None
+            )
             # Apply optimization
             original_tokens = 0  # Set before try so error handler can use it
             optimized_tokens = 0
@@ -163,17 +173,26 @@ class BatchHandlerMixin:
                 # Use OpenAI pipeline (similar message format after conversion)
                 # Offload off the event loop (#1701): inline apply() blocks
                 # every other request; timeouts fall to the except below.
-                result = await self._run_compression_in_executor(
-                    lambda messages=messages, model=model, context_limit=context_limit: (
-                        self.openai_pipeline.apply(
-                            messages=messages,
-                            model=model,
-                            model_limit=context_limit,
-                            context=extract_user_query(messages),
-                        )
-                    ),
-                    timeout=COMPRESSION_TIMEOUT_SECONDS,
-                )
+                item_request_id = f"{request_id}:item:{idx}"
+                with (
+                    activate_policy_side_effect_transaction(item_transaction)
+                    if item_transaction is not None
+                    else nullcontext()
+                ):
+                    result = await self._run_compression_in_executor(
+                        lambda messages=messages, model=model, context_limit=context_limit, item_request_id=item_request_id: (
+                            self.openai_pipeline.apply(
+                                messages=messages,
+                                model=model,
+                                model_limit=context_limit,
+                                context=extract_user_query(messages),
+                                request_id=item_request_id,
+                                session_id=request_id,
+                                recovery_payload_path="google",
+                            )
+                        ),
+                        timeout=COMPRESSION_TIMEOUT_SECONDS,
+                    )
 
                 optimized_messages = result.messages
                 for k, v in result.timing.items():
@@ -187,6 +206,8 @@ class BatchHandlerMixin:
                         f"[{request_id}] Batch item optimization inflated tokens "
                         f"({original_tokens} -> {optimized_tokens}), reverting"
                     )
+                    if item_transaction is not None:
+                        item_transaction.discard()
                     optimized_messages = messages
                     optimized_tokens = original_tokens
 
@@ -267,6 +288,8 @@ class BatchHandlerMixin:
                 }
 
                 compressed_requests.append(compressed_req)
+                if item_transaction is not None and parent_transaction is not None:
+                    parent_transaction.merge_from(item_transaction)
 
                 if tokens_saved > 0:
                     logger.debug(
@@ -276,6 +299,8 @@ class BatchHandlerMixin:
                     )
 
             except Exception as e:
+                if item_transaction is not None:
+                    item_transaction.discard()
                 logger.warning(
                     f"[{request_id}] Optimization failed for Google batch request {idx}: {e}"
                 )
@@ -1125,28 +1150,52 @@ class BatchHandlerMixin:
                     total_requests += 1
                     continue
 
-                # Compress messages using the OpenAI pipeline
+                # Compress messages using the OpenAI pipeline. Isolate each
+                # JSONL row so a failed/inflated row cannot publish policy
+                # events or CCR candidates alongside successful siblings.
+                parent_transaction = current_policy_side_effect_transaction()
+                line_transaction = (
+                    PolicySideEffectTransaction() if parent_transaction is not None else None
+                )
                 if self.config.optimize:
                     try:
                         context_limit = self.openai_provider.get_context_limit(model)
                         # Offload off the event loop (#1701); timeouts fall to
                         # the except below and pass the line through.
-                        result = await self._run_compression_in_executor(
-                            lambda messages=messages, model=model, context_limit=context_limit: (
-                                self.openai_pipeline.apply(
-                                    messages=messages,
-                                    model=model,
-                                    model_limit=context_limit,
-                                    context=extract_user_query(messages),
-                                )
-                            ),
-                            timeout=COMPRESSION_TIMEOUT_SECONDS,
+                        line_request_id = (
+                            f"{request_id}:line:{i}:{request_obj.get('custom_id') or ''}"
                         )
+                        with (
+                            activate_policy_side_effect_transaction(line_transaction)
+                            if line_transaction is not None
+                            else nullcontext()
+                        ):
+                            result = await self._run_compression_in_executor(
+                                lambda messages=messages, model=model, context_limit=context_limit, line_request_id=line_request_id: (
+                                    self.openai_pipeline.apply(
+                                        messages=messages,
+                                        model=model,
+                                        model_limit=context_limit,
+                                        context=extract_user_query(messages),
+                                        request_id=line_request_id,
+                                        session_id=request_id,
+                                        recovery_payload_path="openai_chat",
+                                    )
+                                ),
+                                timeout=COMPRESSION_TIMEOUT_SECONDS,
+                            )
                         compressed_messages = result.messages
                         # Use pipeline's token counts for consistency with pipeline logs
                         original_tokens = result.tokens_before
                         compressed_tokens = result.tokens_after
+                        if compressed_tokens > original_tokens:
+                            if line_transaction is not None:
+                                line_transaction.discard()
+                            compressed_messages = messages
+                            compressed_tokens = original_tokens
                     except Exception as e:
+                        if line_transaction is not None:
+                            line_transaction.discard()
                         logger.warning(f"[{request_id}] Compression failed for line {i}: {e}")
                         compressed_messages = messages
                         original_tokens = tokenizer.count_messages(messages)
@@ -1183,6 +1232,8 @@ class BatchHandlerMixin:
                 request_obj["body"] = body
 
                 compressed_lines.append(json.dumps(request_obj))
+                if line_transaction is not None and parent_transaction is not None:
+                    parent_transaction.merge_from(line_transaction)
                 total_requests += 1
 
             except json.JSONDecodeError as e:

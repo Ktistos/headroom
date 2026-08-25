@@ -51,6 +51,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+from ..ccr.retrieval_reference import attach_retrieval_handle
 from ..ccr.tool_injection import CCR_TOOL_NAME
 from ..config import CCRConfig, TransformResult, is_tool_excluded
 from ..tokenizer import Tokenizer
@@ -443,9 +444,9 @@ class SmartCrusher(Transform):
         self._rust_by_lossless_only: dict[bool, Any] = {}
         self._rust = self._build_rust(self._lossless_only)
 
-    def _build_rust(self, lossless_only: bool) -> Any:
-        """Build (and cache) the Rust crusher for a `lossless_only` value."""
-        cached = self._rust_by_lossless_only.get(lossless_only)
+    def _build_rust(self, lossless_only: bool, *, cache: bool = True) -> Any:
+        """Build a Rust crusher, caching only production executions."""
+        cached = self._rust_by_lossless_only.get(lossless_only) if cache else None
         if cached is not None:
             return cached
         kwargs = dict(self._rust_cfg_kwargs)
@@ -461,7 +462,8 @@ class SmartCrusher(Transform):
             rust = self._RustSmartCrusher.with_compaction_format(
                 rust_cfg, self._resolved_compaction_format
             )
-        self._rust_by_lossless_only[lossless_only] = rust
+        if cache:
+            self._rust_by_lossless_only[lossless_only] = rust
         return rust
 
     def crush(
@@ -470,6 +472,16 @@ class SmartCrusher(Transform):
         query: str = "",
         bias: float = 1.0,
         lossless_only: bool | None = None,
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        provider_slot: str | None = None,
+        record_outcome: bool = True,
+        record_toin: bool | None = None,
     ) -> CrushResult:
         """Crush a single JSON content string.
 
@@ -483,6 +495,10 @@ class SmartCrusher(Transform):
         but any path that would need a CCR marker (row-drop or
         opaque-blob offload) leaves the content uncompacted instead.
         `None` (default) uses the instance's configured value.
+
+        `record_toin` defaults to `record_outcome`. Retrieval-aware callers
+        disable it temporarily and commit the same observation only after the
+        enclosing provider request is accepted.
         """
         # Web search tools often return space-separated JSON objects
         # (``{...} {...} {...}``) rather than a real array. The Rust crusher
@@ -494,7 +510,7 @@ class SmartCrusher(Transform):
         rust = (
             self._rust
             if lossless_only is None or bool(lossless_only) == self._lossless_only
-            else self._build_rust(bool(lossless_only))
+            else self._build_rust(bool(lossless_only), cache=record_outcome)
         )
         r = rust.crush(content, query, bias)
         # Re-attach the TOIN learning loop. The retired Python class
@@ -509,25 +525,38 @@ class SmartCrusher(Transform):
         # JSON re-canonicalization (whitespace normalization) without
         # actually compressing — the strategy stays `"passthrough"` in
         # that case, and there's no learning value in recording it.
-        if r.was_modified and r.strategy != "passthrough":
+        should_record_toin = record_outcome if record_toin is None else bool(record_toin)
+        if should_record_toin and r.was_modified and r.strategy != "passthrough":
             self._record_to_toin(
                 original=content,
                 compressed=r.compressed,
                 strategy=r.strategy,
                 query_context=query,
-                tool_name=None,
+                tool_name=tool_name,
             )
+        # Add the opaque event selector before mirroring. The Rust payload
+        # remains hash-addressed internally; only the emitted marker and Python
+        # store attribution carry the handle.
+        rendered = r.compressed
+        if record_outcome and retrieval_handle and "<<ccr:" in rendered:
+            rendered = attach_retrieval_handle(rendered, retrieval_handle)
         # Bridge any CCR markers emitted by the Rust crusher into the
         # Python compression_store so /v1/retrieve resolves them.
-        # See `_mirror_ccr_to_python_store` for full rationale.
-        self._mirror_ccr_to_python_store(
-            rendered=r.compressed,
-            strategy=r.strategy,
-            query_context=query,
-            tool_name=None,
-        )
+        if record_outcome:
+            self._mirror_ccr_to_python_store(
+                rendered=rendered,
+                strategy=r.strategy,
+                query_context=query,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                session_id=session_id,
+                request_id=request_id,
+                compression_event_id=compression_event_id,
+                retrieval_handle=retrieval_handle,
+                provider_slot=provider_slot,
+            )
         return CrushResult(
-            compressed=r.compressed,
+            compressed=rendered,
             original=r.original,
             was_modified=r.was_modified,
             strategy=r.strategy,
@@ -1007,6 +1036,12 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
+        tool_call_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        provider_slot: str | None = None,
     ) -> None:
         """Walk `rendered` for any `<<ccr:HASH ...>>` markers and mirror
         each into the Python `compression_store`.
@@ -1023,6 +1058,12 @@ class SmartCrusher(Transform):
             strategy=strategy,
             query_context=query_context,
             tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            request_id=request_id,
+            compression_event_id=compression_event_id,
+            retrieval_handle=retrieval_handle,
+            provider_slot=provider_slot,
         )
 
     def _mirror_ccr_markers_in_text(
@@ -1031,6 +1072,12 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
+        tool_call_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        provider_slot: str | None = None,
     ) -> None:
         """Find every distinct `<<ccr:HASH...>>` hash in `rendered` and
         mirror Rust→Python store for each.
@@ -1058,6 +1105,12 @@ class SmartCrusher(Transform):
                 strategy=strategy,
                 query_context=query_context,
                 tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                session_id=session_id,
+                request_id=request_id,
+                compression_event_id=compression_event_id,
+                retrieval_handle=retrieval_handle,
+                provider_slot=provider_slot,
             )
 
     @staticmethod
@@ -1117,6 +1170,12 @@ class SmartCrusher(Transform):
         strategy: str,
         query_context: str,
         tool_name: str | None,
+        tool_call_id: str | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        compression_event_id: str | None = None,
+        retrieval_handle: str | None = None,
+        provider_slot: str | None = None,
     ) -> None:
         """Mirror a single Rust-stored CCR entry into the Python
         compression_store, keyed by `ccr_hash`. Best-effort.
@@ -1157,6 +1216,12 @@ class SmartCrusher(Transform):
                 # `original_content` and `compressed` isn't surfaced.
                 compressed=f"<<ccr:{ccr_hash}>>",
                 tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                session_id=session_id,
+                request_id=request_id,
+                compression_event_id=compression_event_id,
+                retrieval_handle=retrieval_handle,
+                provider_slot=provider_slot,
                 query_context=query_context if query_context else None,
                 compression_strategy=strategy,
                 explicit_hash=ccr_hash,
